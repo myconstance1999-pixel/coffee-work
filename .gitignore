@@ -1,0 +1,14 @@
+# Generated build and QA output — never publish these.
+build/
+dist/
+qa/build/
+qa/dist/
+qa/state/
+qa/MenuBar.isolated.swift
+qa/MenuBar.qa.swift
+qa/production-vs-qa.diff
+
+# Local Python and macOS noise.
+__pycache__/
+*.pyc
+.DS_Store
