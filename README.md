@@ -3,6 +3,10 @@
 **v1.5 source preview.** Build from source. A Developer ID-signed, notarized
 download is not available. See the [v1.5 source release](https://github.com/myconstance1999-pixel/coffee-work/releases/tag/v1.5).
 
+**中文用户手册：[docs/USER_GUIDE.zh-CN.md](docs/USER_GUIDE.zh-CN.md)** —
+a practical Simplified Chinese guide to what Coffee does when Codex stops, the Mac
+sleeps, locks, or loses power.
+
 Coffee Work is a small native macOS menu-bar utility that keeps a Mac from going
 to *system idle sleep* while you are working — automatically while a local Codex
 desktop task is running, and manually for a bounded timer. It is a self-contained
