@@ -1,5 +1,5 @@
 #!/bin/bash
-# Codex Work Mode QA — isolated acceptance-harness build (v1.5).
+# Codex Work Mode QA — isolated acceptance-harness build (v1.8).
 #
 # Builds a SEPARATE "Codex Work Mode QA.app" from the exact current production
 # MenuBar.swift. Only isolation/test seams change: the injected `folder`
@@ -45,7 +45,7 @@ LIVE_FOLDER_LITERAL='Library/Application Support/Codex Work Mode'
 ICON="$SCRIPT_DIR/../bundle/AppIcon.icns"
 TARGET="arm64-apple-macosx13.0"
 MINIMUM_SYSTEM_VERSION="13.0"
-VERSION="1.5"
+VERSION="1.8"
 
 echo "== QA root: $QA_ROOT =="
 

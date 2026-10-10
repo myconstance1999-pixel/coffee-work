@@ -21,7 +21,7 @@ APP="dist/Codex Work Mode.app"
 BIN="$APP/Contents/MacOS/CodexWorkMode"
 TARGET="arm64-apple-macosx13.0"
 MINIMUM_SYSTEM_VERSION="13.0"
-VERSION="1.5"
+VERSION="1.8"
 PYTHON="/usr/bin/python3"
 
 echo "== cleaning dist/ build/ =="
@@ -35,6 +35,7 @@ echo "== staging public bundle metadata and icon =="
 
 echo "== compiling MenuBar.swift (-target $TARGET) =="
 /usr/bin/swiftc -O -target "$TARGET" \
+    -module-cache-path build/compile-cache \
     -framework AppKit -framework CoreGraphics -framework IOKit \
     MenuBar.swift -o "$BIN"
 

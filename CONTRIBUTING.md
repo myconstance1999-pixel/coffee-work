@@ -27,13 +27,14 @@ macOS utility, so a few rules matter more than usual.
 * **No personal paths or secrets in committed files.** Hooks are rendered by
   `hooks/render-hooks.py` for the installing user; never commit a rendered
   `hooks.json`, a home directory, or session/activity data.
-* **English only** in source comments, docs, and commit messages.
+* **English** in source comments, engineering notes, and commit messages;
+  retain the Chinese user guides and localized product UI.
 
 ## Layout
 
 ```
 MenuBar.swift              menu-bar app (AppKit, arm64, macOS 13+)
-toggle.zsh                 manual timer helper (owns the caffeinate session)
+toggle.zsh                 manual background timer helper (owns its caffeinate session)
 activity-hook.py           Codex hook receiver (stdlib Python 3)
 build.sh                   portable staged build of dist/Codex Work Mode.app
 bundle/                    public bundle metadata + icon (Info.plist, PkgInfo, AppIcon.icns)
@@ -53,9 +54,9 @@ installs, launches, trusts, or registers anything.
 
 ## Test
 
-The focused entry point runs the Swift parser suites, the receiver tests, the
-portable hooks-renderer tests, the helper lifecycle tests, the source-contract
-checks, and the read-only session observer:
+The focused entry point runs the Swift parser and native-menu suites, the receiver
+and bounded-diagnostics tests, the portable hooks-renderer tests, the helper
+lifecycle tests, the source-contract checks, and the read-only session observer:
 
 ```sh
 ./tests/validate.sh
@@ -67,11 +68,26 @@ Individual pieces:
 # Receiver: ancestry filter, reducer, privacy, permissions, locking.
 /usr/bin/python3 tests/activity-hook-tests.py
 
+# Receiver diagnostics: reason metadata, exclusion, rotation, failure isolation.
+/usr/bin/python3 tests/diagnostic-tests.py
+
+# Display/automatic assertion contract in the production source.
+/usr/bin/python3 tests/assertion-contract-tests.py
+
 # Hooks renderer: shell quoting, refusal, exclusive creation.
 /usr/bin/python3 tests/render-hooks-tests.py
 
 # Manual helper lifecycle against a private state root (needs the real /bin/ps).
 /bin/zsh tests/helper-lifecycle-tests.sh
+
+# Native menu construction, availability uncertainty, locked background, GUI timer.
+/bin/zsh tests/validate-menu.sh
+/bin/zsh tests/validate-availability.sh
+/bin/zsh tests/validate-locked-background.sh
+/bin/zsh tests/validate-gui.sh
+
+# Receiver, diagnostics, awake behavior, and a full app compile.
+/bin/zsh tests/validate-diagnostics.sh
 
 # Read-only session/power observer (compiles the production adapters).
 /bin/mkdir -p build
@@ -86,6 +102,9 @@ Individual pieces:
 `tests/validate.sh` writes its compiler output under `build/`. The lifecycle
 script replaces exactly one line of the production helper (`state_dir=`) and
 nothing else; if that seam ever grows, the script's normalization gate fails.
+Some validators deliberately report `BLOCKED` and exit non-zero when the
+environment cannot supply a real process-table signature; that is a blocker to
+resolve by running on an authorized host, never by shimming the probe.
 
 ## Optional isolated QA harness
 

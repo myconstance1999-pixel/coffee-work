@@ -44,10 +44,40 @@
 // helper, receiver, or hook behavior changes.
 //
 // Version 1.5 makes both awake sources session- and power-aware, and switches
-// every caffeinate request to system idle-sleep prevention only (`-i`); the
-// display is never held on, so the screen may turn off normally and a dark
-// screen is never treated as a lock. One shared gate decides whether either
-// source may assert:
+// ordinary caffeinate requests to system idle-sleep prevention only (`-i`); the
+// normal mode never holds the display on, so it may turn off and a dark
+// screen is never treated as a lock. Version 1.6 adds an explicit bounded GUI
+// timer (`-d -i`), with the same session gate. Version 1.7.2 permits automatic
+// idle-sleep protection while locked only on AC with a valid working hook
+// snapshot. Manual and GUI timers still require an unlocked session. Sleep,
+// inactive/unknown sessions, and unavailable power remain ineligible.
+//
+// Version 1.8 makes the two explicit awake sources independent and extends the
+// explicit display request:
+//   * the manual background timer, the explicit display hold, and automatic
+//     background work may all be configured at the same time; starting or
+//     stopping one never changes another source's deadline or process, and the
+//     compact menu carries one truthful status and one stop action per source;
+//   * the "保持屏幕显示" submenu offers 30 minutes, 1/4/8 hours, a custom whole
+//     hour count from 1 through 24, and an until-stopped request. It is offered
+//     on battery and in Low Power Mode because eligibility is the current
+//     unlocked active session alone, never the power source or energy mode, and
+//     no OS energy setting is written;
+//   * a finite display request keeps one absolute deadline that survives pauses
+//     unchanged and never revives after expiry or cancellation. An until-stopped
+//     request is a distinct, memory-only state covered by bounded owner-tied
+//     `-d -i -t 300 -w <app pid>` leases renewed every 240 seconds, so a hung app
+//     can never leave a stray indefinite child behind. Every display child uses
+//     `-d -i -t <= 86400 -w <app pid>`, never `-u` or `-s` and never simulated
+//     input, and an app restart never restores a display request;
+//   * a user-invoked "立即启动屏保" row opens the installed system
+//     ScreenSaverEngine through NSWorkspace. It ends only this app's explicit
+//     display hold so Coffee does not fight the user's choice, leaves background
+//     and automatic awake work untouched, writes no screen saver, timeout,
+//     password or energy setting, and never claims the screen saver is running
+//     when the launcher fails.
+//
+// The original manual and GUI gate requires:
 //   * the current login session must be the active console session, unlocked
 //     and past login, read through the same `SessionSampler` adapter used by
 //     the isolated session observer;
@@ -68,6 +98,113 @@ import AppKit
 import CoreGraphics
 import Dispatch
 import IOKit.ps
+import UniformTypeIdentifiers
+
+/// Local metadata only. Four 256 KiB files per producer; logging failures never
+/// participate in an awake decision. Logs live below the watched directories,
+/// so appends do not trigger a refresh loop.
+final class DiagnosticLog {
+    static let maximumBytes = 256 * 1024
+    static let archives = 3
+    static let fieldNames: Set<String> = [
+        "reason", "status", "session", "power", "enabled", "held", "requested",
+        "owner_pid", "pid", "exit_code", "error_code", "mode", "paused",
+        "grace_until", "working_count", "waiting_count", "version", "expires"
+    ]
+    let directory: URL
+    let lock = NSLock()
+    private var lastObservations: [String: [String: String]] = [:]
+
+    init(directory: URL) { self.directory = directory }
+
+    func record(_ event: String, fields: [String: Any] = [:]) {
+        lock.lock()
+        defer { lock.unlock() }
+        append(event, fields: fields)
+    }
+
+    /// Repeated state reads are not events; preserve transitions without
+    /// producing a line for every file notification or menu refresh.
+    func observation(_ event: String, fields: [String: String]) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard lastObservations[event] != fields else { return }
+        lastObservations[event] = fields
+        append(event, fields: fields)
+    }
+
+    private func append(_ event: String, fields: [String: Any]) {
+        var row: [String: Any] = ["timestamp": ISO8601DateFormatter().string(from: Date()),
+                                  "producer": "app", "event": String(event.prefix(64))]
+        for (key, value) in fields where Self.fieldNames.contains(key) {
+            if let string = value as? String { row[key] = String(string.prefix(120)) }
+            else if value is NSNumber { row[key] = value }
+        }
+        guard var data = try? JSONSerialization.data(withJSONObject: row, options: [.sortedKeys]) else { return }
+        data.append(10)
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                     attributes: [.posixPermissions: 0o700])
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+            let path = directory.appendingPathComponent("app.jsonl")
+            let size = (try? path.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            if size + data.count > Self.maximumBytes {
+                for index in stride(from: Self.archives, through: 1, by: -1) {
+                    let destination = directory.appendingPathComponent("app.jsonl.\(index)")
+                    if FileManager.default.fileExists(atPath: destination.path) {
+                        try FileManager.default.removeItem(at: destination)
+                    }
+                    let source = index == 1 ? path : directory.appendingPathComponent("app.jsonl.\(index - 1)")
+                    if FileManager.default.fileExists(atPath: source.path) {
+                        try FileManager.default.moveItem(at: source, to: destination)
+                    }
+                }
+            }
+            let fd = open(path.path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0o600)
+            guard fd >= 0 else { return }
+            defer { close(fd) }
+            _ = fchmod(fd, 0o600)
+            data.withUnsafeBytes { bytes in _ = write(fd, bytes.baseAddress, bytes.count) }
+        } catch { /* Best effort: diagnostic I/O cannot change policy. */ }
+    }
+
+    /// Export only the two known producers' bounded files, never arbitrary
+    /// support files, snapshots, raw payloads, or hidden lock files.
+    func export(to destination: URL, hookDirectory: URL) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        let temporary = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let package = temporary.appendingPathComponent("Coffee Work Diagnostics")
+        try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        for (producer, source) in [("app", directory), ("hook", hookDirectory)] {
+            for suffix in [""] + (1...Self.archives).map({ ".\($0)" }) {
+                let name = producer + ".jsonl" + suffix
+                let file = source.appendingPathComponent(name)
+                guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey]),
+                      values.isRegularFile == true, values.isSymbolicLink != true,
+                      (values.fileSize ?? 0) <= Self.maximumBytes else { continue }
+                if let data = try? Data(contentsOf: file) {
+                    try data.write(to: package.appendingPathComponent(name))
+                }
+            }
+        }
+        let note = "Local diagnostic metadata. Times are UTC. Display-off is distinct from screen lock and system sleep. Missing events are not proof that an event did not occur; crashes cannot log their own termination. No prompt/tool/media content is collected.\n"
+        try note.write(to: package.appendingPathComponent("README.txt"), atomically: true, encoding: .utf8)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        process.arguments = ["-c", "-k", "--keepParent", package.path, destination.path]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw NSError(domain: "CoffeeWorkDiagnostics", code: Int(process.terminationStatus))
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
+    }
+}
 
 /// Undocumented key used by `CGSessionCopyCurrentDictionary` to expose the
 /// current screen-lock state. It is not declared in a public header, so it is
@@ -94,24 +231,25 @@ enum SessionState: Equatable {
     case unknown
 }
 
-/// The one shared eligibility rule used by automatic awake, manual awake, and
-/// the menu's explanation row. Pure and clock-free so it can be exercised
-/// directly.
+/// Pure session and task eligibility rules. Manual and GUI holds require an
+/// unlocked session; automatic background holds have a narrow locked allowance.
 enum AwakeGate {
-    /// Only the active, unlocked console session may hold any awake assertion.
+    /// Manual and GUI assertions require the active, unlocked console session.
     static func sessionAllowsAssertion(_ state: SessionState) -> Bool {
         state == .active
     }
 
-    /// Automatic awake requires the toggle, external power, and an eligible
-    /// session. Battery, an unknown power source, a lock/sleep/inactive/unknown
-    /// session, or a disabled toggle all make it ineligible immediately.
+    /// A locked session additionally requires a currently verified working
+    /// task. Idle, approval waits, invalid snapshots and grace never qualify
+    /// while locked. Actual sleep and inactive/unknown sessions always win.
     static func autoEligible(
         enabled: Bool,
         power: PowerAvailability,
-        session: SessionState
+        session: SessionState,
+        working: Bool
     ) -> Bool {
-        enabled && power == .external && sessionAllowsAssertion(session)
+        enabled && power == .external
+            && (sessionAllowsAssertion(session) || (session == .locked && working))
     }
 
     /// Human-readable reason the automatic assertion is or is not held, for the
@@ -132,7 +270,9 @@ enum AwakeGate {
         guard enabled else { return "Auto: off" }
         switch session {
         case .sleeping: return "Auto: paused — asleep"
-        case .locked: return "Auto: paused — screen locked"
+        case .locked:
+            guard working else { return "Auto: paused — screen locked, no verified work" }
+            break
         case .inactive: return "Auto: paused — session inactive"
         case .unknown: return "Auto: paused — session unavailable"
         case .active: break
@@ -142,9 +282,12 @@ enum AwakeGate {
         case .unknown: return "Auto: paused — power source unavailable"
         case .external: break
         }
-        if held { return gracePending ? "Auto: holding (120s grace)" : "Auto: holding" }
+        if held {
+            if session == .locked { return "Auto: holding — locked, verified work, AC" }
+            return gracePending ? "Auto: holding (120s grace)" : "Auto: holding"
+        }
         if asserting { return "Auto: not holding — assertion unavailable" }
-        return working ? "Auto: starting" : "Auto: ready — no Codex work"
+        return working ? "Auto: starting" : "Auto: ready — local hooks idle"
     }
 }
 
@@ -301,9 +444,10 @@ enum SessionChange {
 
 /// Separately latched sleep, inactive, and lock state.
 ///
-/// The latches exist so that a wake cannot by itself resume an assertion while
-/// the screen is still locked and so a stale sampled snapshot cannot override a
-/// just-delivered lock or sleep notification. A latch is only cleared by its
+/// The latches preserve lock identity across wake and prevent a stale sampled
+/// active snapshot from overriding a just-delivered lock or sleep notification.
+/// A lock latch cannot upgrade an unknown/non-console snapshot to eligibility.
+/// A latch is only cleared by its
 /// matching counterpart notification (`willSleep`/`didWake`,
 /// `resignedActive`/`becameActive`, `screenLocked`/`screenUnlocked`), never by
 /// a snapshot read.
@@ -329,7 +473,9 @@ struct SessionGate {
     func resolve(snapshot: SessionState) -> SessionState {
         if sleeping { return .sleeping }
         if inactive { return .inactive }
-        if locked { return .locked }
+        if locked {
+            return snapshot == .active || snapshot == .locked ? .locked : snapshot
+        }
         return snapshot
     }
 }
@@ -440,6 +586,27 @@ enum CustomHours {
         guard trimmed.allSatisfy({ $0.isASCII && $0.isNumber }) else { return nil }
         guard let value = Int(trimmed), (minimum...maximum).contains(value) else { return nil }
         return value
+    }
+}
+
+/// The two places the bounded 1...24 whole-hour input is used. Only the wording
+/// differs; the parser contract is shared.
+enum CustomHoursPurpose {
+    case background
+    case display
+
+    var heading: String {
+        switch self {
+        case .background: return "后台工作保持多久？"
+        case .display: return "保持屏幕显示多久？"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .background: return "屏保与息屏照常；锁屏/睡眠时暂停。"
+        case .display: return "保持显示与电脑唤醒；自动屏保会暂缓；电池供电同样可用；锁屏/睡眠时暂停，原结束时间不变。"
+        }
     }
 }
 
@@ -660,12 +827,14 @@ enum PowerStatusParser {
 
 /// What the Codex activity snapshot currently says about local desktop work.
 ///
-/// `connectionNotSeen` means no snapshot has ever been published; `idle` means
-/// a snapshot exists but no live turn is open; `waiting` means at least one
+/// `connectionNotSeen` means the snapshot is missing; `unavailable` means its
+/// contents or owner cannot be verified. `idle` requires a valid snapshot with
+/// no live turn open; `waiting` means at least one
 /// known turn is waiting for approval and none is working; `working` means at
 /// least one known turn is actively working.
 enum ActivityStatus: Equatable {
     case connectionNotSeen
+    case unavailable
     case idle
     case waiting
     case working
@@ -692,6 +861,13 @@ struct ActivitySnapshot: Equatable {
         freshestRefresh: nil
     )
 
+    static let unavailable = ActivitySnapshot(
+        status: .unavailable,
+        ownerPID: nil,
+        ownerSignature: nil,
+        freshestRefresh: nil
+    )
+
     var isWorking: Bool { status == .working }
 }
 
@@ -701,7 +877,7 @@ struct ActivitySnapshot: Equatable {
 /// of age, so a missed Stop can never keep the Mac awake forever; a long tool
 /// is never cut for lack of events, because activity is judged by turn age, not
 /// by how recently an event arrived. Malformed JSON is rejected (`nil`) and the
-/// app treats the snapshot as idle rather than guessing.
+/// app reports the snapshot as unavailable rather than guessing.
 enum ActivitySnapshotParser {
     static let maximumTurnAge: Double = 24 * 60 * 60
     static let maximumClockSkew: Double = 60
@@ -752,14 +928,14 @@ enum ActivitySnapshotParser {
 /// Pure, clock-injected automatic-awake state machine.
 ///
 /// `step(working:eligible:now:)` is fed whether any known Codex turn is actively
-/// working and whether the shared gate (toggle on, external power, active
-/// unlocked session) currently allows an assertion. While a turn works and the
-/// gate is eligible the automatic assertion is held immediately. When no turn
+/// working and whether the automatic gate (toggle on, external power, active
+/// session or locked with verified work) currently allows an assertion. While
+/// a turn works and the gate is eligible the automatic assertion is held immediately. When no turn
 /// works (all stopped, or only waiting for approval) the engine keeps the
 /// assertion for a 120 second grace period and then releases it; new work
 /// cancels the grace at once. The grace survives only while the gate stays
-/// eligible: battery/unknown power, a lock, or sleep releases the assertion and
-/// clears the grace immediately, and new work cannot restart it while
+/// eligible: battery/unknown power, a lock without work, or sleep releases the
+/// assertion and clears the grace immediately, and new work cannot restart it while
 /// ineligible. Manual helper state is deliberately not an input: the two awake
 /// sources are independent.
 struct AutoAwakeEngine {
@@ -892,18 +1068,453 @@ final class ActivityDirectoryWatch {
     }
 }
 
+/// User-facing presentation only; this never changes an awake decision.
+struct MenuPresentation {
+    let heading: String
+    let timing: String
+    let effect: String
+    let note: String
+
+    /// An until-stopped display request has no deadline at all, so its row shows
+    /// this stable state instead of a fabricated countdown or end time.
+    static let untilStoppedTiming = "直到我关闭"
+
+    var compactSummary: String {
+        // Closed-menu tooltips use the fixed end time, never a stale countdown.
+        let end = timing.components(separatedBy: " · ").last ?? ""
+        return [heading, end, effect].filter { !$0.isEmpty }.joined(separator: " · ")
+    }
+
+    static func timing(deadline: Double?, now: Double) -> String {
+        guard let deadline = deadline else { return "结束时间暂时无法读取" }
+        let remaining = max(0, Int(ceil(deadline - now)))
+        let clock = remaining >= 3600
+            ? String(format: "%d:%02d:%02d", remaining / 3600, remaining / 60 % 60, remaining % 60)
+            : String(format: "%02d:%02d", remaining / 60, remaining % 60)
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        return "剩余 \(clock) · \(formatter.string(from: Date(timeIntervalSince1970: deadline))) 结束"
+    }
+}
+
+/// A read-only native status card. Live clocks retitle its labels in place,
+/// leaving menu actions stable while the user is selecting an item.
+final class WorkMenuStatusView: NSView {
+    let heading = NSTextField(labelWithString: "")
+    let timing = NSTextField(labelWithString: "")
+    let effect = NSTextField(labelWithString: "")
+    let note = NSTextField(labelWithString: "")
+
+    init(_ presentation: MenuPresentation) {
+        let detailed = !presentation.timing.isEmpty || !presentation.note.isEmpty
+        super.init(frame: NSRect(x: 0, y: 0, width: 340, height: detailed ? 100 : 62))
+        heading.font = .systemFont(ofSize: 14, weight: .semibold)
+        heading.textColor = .labelColor
+        timing.font = .monospacedDigitSystemFont(ofSize: 12.5, weight: .medium)
+        timing.textColor = .labelColor
+        effect.font = .systemFont(ofSize: 12)
+        effect.textColor = .secondaryLabelColor
+        note.font = .systemFont(ofSize: 11.5)
+        note.textColor = .secondaryLabelColor
+        for label in [heading, timing, effect, note] {
+            label.lineBreakMode = .byTruncatingTail
+            addSubview(label)
+        }
+        heading.frame = NSRect(x: 16, y: detailed ? 75 : 35, width: 308, height: 21)
+        timing.frame = NSRect(x: 16, y: 53, width: 308, height: 19)
+        effect.frame = NSRect(x: 16, y: detailed ? 31 : 12, width: 308, height: 19)
+        note.frame = NSRect(x: 16, y: 10, width: 308, height: 18)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        update(presentation)
+    }
+
+    required init?(coder: NSCoder) { fatalError("Programmatic native menu view") }
+
+    func update(_ presentation: MenuPresentation) {
+        heading.stringValue = presentation.heading
+        timing.stringValue = presentation.timing
+        effect.stringValue = presentation.effect
+        note.stringValue = presentation.note
+        timing.isHidden = presentation.timing.isEmpty
+        note.isHidden = presentation.note.isEmpty
+        setAccessibilityLabel(presentation.heading)
+        setAccessibilityChildren([heading, timing, effect, note].filter { !$0.isHidden })
+    }
+}
+
+/// An explicit, memory-only display request. It shares the session gate and
+/// logger with ordinary timers, but additionally holds display idle sleep.
+///
+/// Two shapes are supported, and both are memory-only (an app restart never
+/// restores a display request):
+///   * a finite request with one absolute deadline, covered by a single bounded
+///     `-d -i -t <remaining> -w <app pid>` child whose timeout is at most the
+///     helper's own 86400 second limit; and
+///   * an until-stopped request, which is a distinct state with no deadline at
+///     all, covered by bounded owner-tied `-t 300` leases renewed every 240
+///     seconds so a hung app can never leave a stray indefinite child behind.
+///
+/// The finite deadline survives pauses unchanged and never revives after
+/// expiry or cancellation. An until-stopped request pauses and resumes while it
+/// remains configured, and a late callback from a released or replaced child can
+/// never revive or cancel the request now in force.
+///
+/// Every transition a running child ends on is published through `onChange`
+/// with an observation of the state that actually holds afterwards, so the
+/// status item and menu can never claim an active display hold that no child is
+/// covering. An until-stopped request that loses its lease keeps the request
+/// and defers exactly one bounded retry to the renewal boundary, and it reports
+/// that released state rather than a session pause. A start that never
+/// succeeded is never described as if it had produced a hold: a failed initial
+/// spawn clears the request outright, like the finite shape already does. All
+/// elapsed lease arithmetic uses `now()`, the same injected clock the tests
+/// drive, so a deterministic test clock can never re-fire a timer from unrelated
+/// wall time.
+final class GUIWorkTimer {
+    /// Shared with the helper's own 1...86400 second duration limit, so a whole
+    /// hour request can never exceed the bound a child is allowed to assert.
+    static let minimumSeconds = 1
+    static let maximumSeconds = 86400
+    /// Every until-stopped child is one bounded, owner-tied lease.
+    static let leaseSeconds = 300
+    static let renewalSeconds: Double = 240
+
+    let diagnostics: DiagnosticLog
+    var onChange: (() -> Void)?
+    var now: () -> Double = { Date().timeIntervalSince1970 }
+    // Isolated tests can substitute a harmless process; production uses only
+    // the system caffeinate executable with the exact bounded arguments.
+    var makeProcess: ([String]) -> Process = { arguments in
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/caffeinate")
+        process.arguments = arguments
+        return process
+    }
+    /// The finite deadline. `nil` for an until-stopped request and when off.
+    private(set) var deadline: Double?
+    /// True while an until-stopped request is configured. It has no deadline.
+    private(set) var untilStopped = false
+    private(set) var process: Process?
+    private var expiryTimer: DispatchSourceTimer?
+    private var leaseTimer: DispatchSourceTimer?
+    private var leaseStartedAt: Double = 0
+    /// True once one lease has actually started running. A start failure before
+    /// that point is an initial failure and clears the request; only a request
+    /// that had a working lease keeps a bounded retry after its lease is lost.
+    private var leaseEverStarted = false
+    /// The next instant a lease event is due: the renewal of a running lease, or
+    /// the single bounded retry after a lost one. `0` means nothing is scheduled
+    /// yet (off, released for an ineligible session), while a future instant
+    /// always names a renewal or retry that is really pending. One absolute
+    /// anchor, so a cleared or pending retry can never be confused with a
+    /// renewal.
+    private var leaseRenewsAt = Double(0)
+    /// Last eligibility the shared session gate published. A scheduled renewal
+    /// reuses it instead of assuming the session is still eligible, so a
+    /// transition that raced the timer can never restart a display lease while
+    /// the session is locked, asleep, inactive, or unknown.
+    private var lastEligible = true
+
+    var configured: Bool { deadline != nil || untilStopped }
+    var held: Bool { process?.isRunning == true }
+    /// An eligible until-stopped request whose owned lease already ended and
+    /// whose one bounded retry is still in the future. The card must report this
+    /// as a released display hold with a pending retry, never as a session pause
+    /// or a live hold, and never as a promise that unlocking alone restores it.
+    var awaitingLeaseRetry: Bool {
+        untilStopped && process == nil && lastEligible && now() < leaseRenewsAt
+    }
+
+    init(diagnostics: DiagnosticLog) { self.diagnostics = diagnostics }
+
+    @discardableResult
+    func start(seconds: Int, eligible: Bool) -> Bool {
+        guard !configured, eligible,
+              (Self.minimumSeconds...Self.maximumSeconds).contains(seconds) else {
+            diagnostics.record("gui_start_rejected", fields: ["reason": "duration_or_session_ineligible"])
+            return false
+        }
+        deadline = now() + Double(seconds)
+        untilStopped = false
+        diagnostics.record("gui_timer_started", fields: ["expires": deadline!, "mode": "display_and_idle_sleep"])
+        scheduleExpiry(seconds: seconds)
+        reconcile(eligible: true)
+        return held
+    }
+
+    /// Starts an until-stopped display request. It has no deadline and is
+    /// distinguished from both an off state and a finite request everywhere it
+    /// is rendered or reconciled.
+    @discardableResult
+    func startUntilStopped(eligible: Bool) -> Bool {
+        guard !configured, eligible else {
+            diagnostics.record("gui_start_rejected", fields: ["reason": "until_stopped_or_session_ineligible"])
+            return false
+        }
+        deadline = nil
+        untilStopped = true
+        leaseStartedAt = 0
+        // No lease event is scheduled yet, so the first reconcile starts the
+        // first lease immediately instead of waiting for a renewal instant.
+        leaseRenewsAt = 0
+        leaseEverStarted = false
+        diagnostics.record("gui_timer_started", fields: ["mode": "display_until_stopped"])
+        reconcile(eligible: true)
+        // A failed initial spawn has already cleared the request and published
+        // that failure, so the caller must not report a started hold.
+        return configured ? held : false
+    }
+
+    func reconcile(eligible: Bool) {
+        lastEligible = eligible
+        guard configured else { return }
+        if let deadline = deadline, now() >= deadline {
+            stop(reason: "deadline_reached")
+            return
+        }
+        if !eligible {
+            // A pause keeps the request (and, for a finite request, its original
+            // deadline) but releases the owned child. The renewal/retry anchor
+            // is cleared so a resume starts a fresh lease immediately and the
+            // paused state is never misreported as a pending retry.
+            release(reason: "session_ineligible")
+            leaseRenewsAt = 0
+            leaseTimer?.cancel()
+            leaseTimer = nil
+        } else if untilStopped {
+            ensureLease()
+        } else {
+            ensureFiniteChild()
+        }
+        // A finite unexpected exit ends the request inside ensureFiniteChild and
+        // stop() has already published that transition; do not add a stale
+        // "paused" observation afterwards.
+        guard configured else { return }
+        diagnostics.observation("gui_observation", fields: ["held": String(held),
+                                "status": held ? "holding" : "paused",
+                                "expires": deadline.map { String($0) } ?? (untilStopped ? "until_stopped" : "none")])
+        onChange?()
+    }
+
+    /// One bounded child covers the whole remaining finite interval. An
+    /// unexpected exit ends the finite request; it is never silently re-armed.
+    private func ensureFiniteChild() {
+        guard let deadline = deadline else { return }
+        if let process = process {
+            if !process.isRunning { processExited(process) }
+            return
+        }
+        let remaining = max(Self.minimumSeconds, min(Self.maximumSeconds, Int(ceil(deadline - now()))))
+        let next = makeProcess(["-d", "-i", "-t", String(remaining),
+                                "-w", String(ProcessInfo.processInfo.processIdentifier)])
+        next.standardOutput = FileHandle.nullDevice
+        next.standardError = FileHandle.nullDevice
+        next.terminationHandler = { [weak self, weak next] _ in
+            DispatchQueue.main.async {
+                guard let next = next else { return }
+                self?.processExited(next)
+            }
+        }
+        do {
+            try next.run()
+            process = next
+            diagnostics.record("gui_assertion_started", fields: ["pid": next.processIdentifier,
+                               "expires": deadline, "reason": "bounded_display_and_idle_sleep"])
+        } catch {
+            diagnostics.record("gui_assertion_start_failed", fields: ["error_code": (error as NSError).code])
+            stop(reason: "start_failed")
+        }
+    }
+
+    /// Keeps exactly one bounded, owner-tied display lease covering an
+    /// until-stopped request, renewing it before the 300 second bound expires.
+    /// A lost lease keeps the request but defers one bounded retry to the
+    /// renewal boundary, so there is no tight loop and no duplicate child.
+    private func ensureLease() {
+        if let process = process, process.isRunning {
+            if now() < leaseRenewsAt {
+                scheduleLeaseRenewal(at: leaseRenewsAt)
+                return
+            }
+            release(reason: "lease_renewal")
+            startLease()
+            return
+        }
+        if let process = process {
+            // The lease is gone. handleLeaseExit publishes the released state,
+            // so the menu and icon never keep claiming a hold that ended.
+            handleLeaseExit(process)
+            return
+        }
+        guard now() < leaseRenewsAt else {
+            // A renewal or retry instant has arrived; start (or replace) the one
+            // bounded lease now and re-anchor the next renewal from it.
+            startLease()
+            return
+        }
+        scheduleLeaseRenewal(at: leaseRenewsAt)
+    }
+
+    private func startLease() {
+        let next = makeProcess(["-d", "-i", "-t", String(Self.leaseSeconds),
+                                "-w", String(ProcessInfo.processInfo.processIdentifier)])
+        next.standardOutput = FileHandle.nullDevice
+        next.standardError = FileHandle.nullDevice
+        next.terminationHandler = { [weak self, weak next] _ in
+            DispatchQueue.main.async {
+                guard let next = next else { return }
+                self?.handleLeaseExit(next)
+            }
+        }
+        do {
+            try next.run()
+            process = next
+            leaseStartedAt = now()
+            leaseEverStarted = true
+            diagnostics.record("gui_assertion_started", fields: ["pid": next.processIdentifier,
+                               "reason": "bounded_display_lease"])
+            // Re-anchor before scheduling: the renewal instant is what the timer
+            // and `ensureLease` both read, so it must already be in the future.
+            leaseRenewsAt = leaseStartedAt + Self.renewalSeconds
+            scheduleLeaseRenewal(at: leaseRenewsAt)
+        } catch {
+            diagnostics.record("gui_assertion_start_failed", fields: ["error_code": (error as NSError).code])
+            process = nil
+            guard leaseEverStarted else {
+                // The very first lease never ran. Never leave a configured
+                // request with no effective child waiting to arm a future hold:
+                // clear it exactly as the finite shape does and publish it.
+                stop(reason: "start_failed")
+                return
+            }
+            // A renewal-spawn failure keeps the bounded request alive but is
+            // reported truthfully: one retry at the next renewal boundary.
+            leaseRenewsAt = now() + Self.renewalSeconds
+            scheduleLeaseRenewal(at: leaseRenewsAt)
+            diagnostics.observation("gui_observation", fields: ["held": "false",
+                                   "status": "lease_start_failed",
+                                   "expires": "until_stopped"])
+            onChange?()
+        }
+    }
+
+    /// Handles an owned until-stopped lease ending on its own. A stale
+    /// notification from a lease this class already released or replaced is
+    /// ignored, and the retry is bounded to the next renewal boundary. The
+    /// released state is published here too: otherwise the icon and menu would
+    /// keep claiming an active display hold until some unrelated refresh.
+    private func handleLeaseExit(_ ended: Process) {
+        guard let current = process, current === ended else { return }
+        diagnostics.record("gui_assertion_exited", fields: ["pid": ended.processIdentifier,
+                           "exit_code": ended.terminationStatus])
+        clearDeadLease(current)
+        leaseRenewsAt = now() + Self.renewalSeconds
+        scheduleLeaseRenewal(at: leaseRenewsAt)
+        reconcile(eligible: lastEligible)
+    }
+
+    private func processExited(_ ended: Process) {
+        guard let current = process, current === ended else { return }
+        diagnostics.record("gui_assertion_exited", fields: ["pid": ended.processIdentifier,
+                           "exit_code": ended.terminationStatus])
+        // An unexpected finite exit ends the request. Never silently re-arm it.
+        stop(reason: now() >= (deadline ?? 0) ? "deadline_reached" : "process_exited")
+    }
+
+    private func scheduleExpiry(seconds: Int) {
+        expiryTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + Double(seconds))
+        timer.setEventHandler { [weak self] in self?.stop(reason: "deadline_reached") }
+        timer.resume()
+        expiryTimer = timer
+    }
+
+    /// Re-arms from the absolute renewal/retry instant, never from a relative
+    /// delay a later read could extend. One-shot and event driven: nothing polls.
+    /// The delay is measured with `now()`, the same clock every lease decision
+    /// uses, so an injected deterministic test clock never disagrees with the
+    /// timer and can never re-fire it against unrelated wall time. A zero delay
+    /// stays one hop away instead of re-entering the event handler directly.
+    private func scheduleLeaseRenewal(at instant: Double) {
+        leaseTimer?.cancel()
+        let delay = max(0, instant - now())
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + delay)
+        timer.setEventHandler { [weak self] in
+            guard let self = self else { return }
+            // This one-shot timer has fired; a later reconcile re-arms it.
+            self.leaseTimer = nil
+            self.reconcile(eligible: self.lastEligible)
+        }
+        timer.resume()
+        leaseTimer = delay > 0 ? timer : nil
+    }
+
+    /// Releases only the owned child. The termination handler is detached
+    /// first, so a deliberate stop can never be mistaken for an unexpected exit
+    /// and revive a cancelled or replaced request.
+    private func release(reason: String) {
+        guard let current = process else { return }
+        process = nil
+        current.terminationHandler = nil
+        diagnostics.record("gui_assertion_released", fields: ["pid": current.processIdentifier,
+                           "reason": reason,
+                           "expires": deadline.map { String($0) } ?? (untilStopped ? "until_stopped" : "none")])
+        if current.isRunning { current.terminate() }
+    }
+
+    /// Drops an owned child that already ended by itself. Unlike a deliberate
+    /// release it never sends a signal; it only detaches the identity so no
+    /// later callback from it can touch a newer request.
+    private func clearDeadLease(_ ended: Process) {
+        process = nil
+        ended.terminationHandler = nil
+    }
+
+    func stop(reason: String) {
+        let previousDeadline = deadline
+        let wasUntilStopped = untilStopped
+        release(reason: reason)
+        deadline = nil
+        untilStopped = false
+        leaseStartedAt = 0
+        leaseRenewsAt = 0
+        leaseEverStarted = false
+        expiryTimer?.cancel()
+        expiryTimer = nil
+        leaseTimer?.cancel()
+        leaseTimer = nil
+        if previousDeadline != nil || wasUntilStopped {
+            diagnostics.record("gui_timer_ended", fields: ["reason": reason,
+                               "expires": previousDeadline.map { String($0) } ?? "until_stopped"])
+        }
+        onChange?()
+    }
+}
+
 final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Installed helper location. The install step, not this app, owns the file.
     /// `var` so an isolated test can point at a private root; production never
     /// reassigns it.
     var folder = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/Codex Work Mode")
+    lazy var diagnostics = DiagnosticLog(directory: folder.appendingPathComponent("diagnostics"))
+    lazy var guiTimer = GUIWorkTimer(diagnostics: diagnostics)
     let queue = DispatchQueue(label: "local.plan.codex-work-mode.commands")
     /// Separate serial queue for the read-only power probe, so a slow
     /// system_profiler run can never delay a start/stop helper action.
     let powerQueue = DispatchQueue(label: "local.plan.codex-work-mode.power")
 
     var item: NSStatusItem!
+    var statusCard: WorkMenuStatusView?
+    var statusHeadingItem: NSMenuItem?
+    /// Read-only manual/background row shown beside the display card when an
+    /// explicit display request owns the card but the manual timer is also
+    /// configured. Retitled in place by the presentation clock.
+    var backgroundStatusItem: NSMenuItem?
+    var menuClock: Timer?
     /// Last known manual helper state (only replaced by a successful status
     /// read). `active`/`pausedManual`/`expiry` are views of it.
     var manualState: ManualState = .off
@@ -1011,6 +1622,7 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        diagnostics.record("app_started", fields: ["version": "1.8", "pid": ProcessInfo.processInfo.processIdentifier])
 
         // The status item exists before any observer can fire, so a
         // notification delivered during launch can never reach the menu code
@@ -1022,6 +1634,10 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item.menu = menu
         item.button?.title = ""
         item.button?.imagePosition = .imageOnly
+        guiTimer.onChange = { [weak self] in
+            self?.updateStatusItem()
+            self?.rebuildMenu()
+        }
 
         // Observers and the IOKit power source are installed BEFORE the first
         // snapshot, so a lock/sleep/power transition landing during launch is
@@ -1083,12 +1699,27 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             (NSWorkspace.sessionDidResignActiveNotification, .resignedActive),
             (NSWorkspace.sessionDidBecomeActiveNotification, .becameActive),
         ]
+        for (name, event) in [(NSWorkspace.screensDidSleepNotification, "display_off"),
+                              (NSWorkspace.screensDidWakeNotification, "display_on")] {
+            NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                // Diagnostic only: display changes never enter the awake gate.
+                self?.diagnostics.record(event)
+            }
+        }
         for (name, change) in workspaceChanges {
             workspace.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 self?.handleSessionChange(change)
             }
         }
         let distributed = DistributedNotificationCenter.default()
+        // A received system notification is not proof of rendered animation
+        // or a lock cause. These best-effort observations never enter the gate.
+        for (name, event) in [("com.apple.screensaver.didstart", "screensaver_started_notification"),
+                              ("com.apple.screensaver.didstop", "screensaver_stopped_notification")] {
+            distributed.addObserver(forName: Notification.Name(name), object: nil, queue: .main) { [weak self] _ in
+                self?.diagnostics.record(event)
+            }
+        }
         let screenLocked = Notification.Name("com.apple.screenIsLocked")
         let screenUnlocked = Notification.Name("com.apple.screenIsUnlocked")
         distributed.addObserver(forName: screenLocked, object: nil, queue: .main) { [weak self] _ in
@@ -1123,6 +1754,9 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             powerMonitor.sample()
             powerAvailability = powerMonitor.availability
         }
+        diagnostics.record("session_event", fields: ["reason": String(describing: change),
+                           "session": String(describing: sessionState), "power": String(describing: powerAvailability)])
+        guiTimer.reconcile(eligible: AwakeGate.sessionAllowsAssertion(sessionState))
         reconcileManualSession()
         refreshActivity()
     }
@@ -1133,6 +1767,9 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // A power change is also a cheap, bounded trigger to recheck the
         // session; the latches still win over the sampled snapshot.
         refreshSessionState(recheckSnapshot: true)
+        diagnostics.record("power_event", fields: ["power": String(describing: powerAvailability),
+                           "session": String(describing: sessionState)])
+        guiTimer.reconcile(eligible: AwakeGate.sessionAllowsAssertion(sessionState))
         reconcileManualSession()
         refreshActivity()
     }
@@ -1183,6 +1820,7 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
         queue.async { [self] in
             let result = invoke(mode)
+            diagnostics.record("manual_transition", fields: ["mode": mode, "exit_code": result.0])
             DispatchQueue.main.async { [self] in
                 busy = false
                 refresh(reconcile: false)
@@ -1209,7 +1847,11 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Stop on quit: never leave an owned bounded session running behind us.
         // Release the automatic assertion first; `off` cancels an active or
         // paused manual session exactly as before.
-        releaseAutoAwake()
+        diagnostics.record("app_quit")
+        menuClock?.invalidate()
+        menuClock = nil
+        guiTimer.stop(reason: "app_quit")
+        releaseAutoAwake(reason: "app_quit")
         manualExpiryTimer?.cancel()
         manualExpiryTimer = nil
         _ = invoke("off")
@@ -1231,6 +1873,73 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: - State
 
+    /// The compact status card. An explicit display request owns the card when
+    /// one is configured; the manual background timer then keeps its own
+    /// read-only row below, so neither source can hide the other. The note also
+    /// names an active automatic hold, so the card never implies the Mac would
+    /// sleep while another owned source is holding it.
+    func menuPresentation(now: Double = Date().timeIntervalSince1970) -> MenuPresentation {
+        if guiTimer.configured {
+            let retrying = guiTimer.awaitingLeaseRetry
+            var note: String
+            if guiTimer.held {
+                note = "结束后，系统可能立即屏保或息屏"
+            } else if retrying {
+                // No child covers the request right now. Say exactly that: it is
+                // not a lock/session pause, and unlocking alone would not explain
+                // it — the app retries once at the next renewal boundary.
+                note = "显示保持暂时未生效，稍后会自动重试一次；锁屏/睡眠会暂停"
+            } else if guiTimer.untilStopped {
+                note = "解除暂停后重新开始保持，直到我关闭"
+            } else {
+                note = "恢复后只继续剩余时间，不重新计时"
+            }
+            if autoHeld { note += " · 后台自动保持中" }
+            return MenuPresentation(heading: guiTimer.held ? "屏幕显示保持中" : "屏幕显示已暂停",
+                timing: guiTimer.untilStopped
+                    ? MenuPresentation.untilStoppedTiming
+                    : MenuPresentation.timing(deadline: guiTimer.deadline, now: now),
+                effect: guiTimer.held
+                    ? "保持显示 · 自动屏保暂缓"
+                    : (guiTimer.untilStopped
+                        ? (retrying ? "显示保持已释放 · 正在重试" : "显示保持已释放 · 直到我关闭")
+                        : "显示保持已释放 · 原结束时间不变"),
+                note: note)
+        }
+        guard statusReadable else {
+            return MenuPresentation(heading: "计时状态暂时无法确认", timing: "",
+                effect: autoHeld ? "后台自动保持中 · 不保持显示" : "请在更多状态中查看详情", note: "")
+        }
+        if active || pausedManual {
+            return MenuPresentation(heading: active ? "后台计时中" : "后台计时已暂停",
+                timing: MenuPresentation.timing(deadline: manualExpiryDeadline, now: now),
+                effect: active ? "仅保持电脑唤醒 · 屏保与息屏照常" : "保持已暂停 · 不保持显示",
+                note: "锁屏/睡眠时暂停，恢复不延长计时")
+        }
+        return MenuPresentation(heading: autoHeld ? "后台自动保持中" : "正常待机", timing: "",
+            effect: autoHeld ? "仅保持电脑唤醒 · 屏保与息屏照常" : "屏保与息屏按系统设置", note: "")
+    }
+
+    func updateMenuClock() {
+        let presentation = menuPresentation()
+        statusCard?.update(presentation)
+        if statusHeadingItem?.title != presentation.heading { statusHeadingItem?.title = presentation.heading }
+        backgroundStatusItem?.title = backgroundMenuLine
+    }
+
+    func startMenuClock() {
+        menuClock?.invalidate()
+        menuClock = nil
+        // A presentation-only clock runs while the menu is open and some visible
+        // value actually changes: a finite display countdown or a manual
+        // countdown. An until-stopped row is a stable state, so it alone does
+        // not start one. No session, power, helper or task polling.
+        guard (guiTimer.configured && !guiTimer.untilStopped) || active || pausedManual else { return }
+        let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in self?.updateMenuClock() }
+        RunLoop.main.add(timer, forMode: .common)
+        menuClock = timer
+    }
+
     var stateLine: String {
         guard statusReadable else { return "Codex Work Mode: status unavailable" }
         switch manualState {
@@ -1251,7 +1960,44 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         expiry.split(separator: " ").dropFirst().first.map(String.init) ?? expiry
     }
 
+    /// Overall display-hold status in English, used by the compact summary
+    /// helpers. An until-stopped request is reported as such and never invents
+    /// an end time.
+    var displayStatusLine: String {
+        if guiTimer.untilStopped {
+            return guiTimer.held ? "Screen display until stopped — display on"
+                                 : "Screen display paused — until stopped"
+        }
+        guard let deadline = guiTimer.deadline else { return "Screen display off" }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        let end = formatter.string(from: Date(timeIntervalSince1970: deadline))
+        return guiTimer.held ? "Screen display until \(end) — display on"
+                             : "Screen display paused — ends at \(end)"
+    }
+
+    /// Read-only manual/background status row for the compact menu when an
+    /// explicit display request owns the status card. It is truthful about a
+    /// paused timer and keeps the helper's original end time visible.
+    var backgroundMenuLine: String {
+        guard active || pausedManual else {
+            return autoHeld ? "后台自动保持中" : "后台计时：未开启"
+        }
+        let timing = MenuPresentation.timing(deadline: manualExpiryDeadline,
+                                             now: Date().timeIntervalSince1970)
+        return (pausedManual ? "后台计时已暂停 · " : "后台计时中 · ") + timing
+    }
+
+    /// The display stop row never claims to restore normal sleep while another
+    /// owned source is still holding the Mac awake.
+    var displayStopTitle: String {
+        let backgroundHeld = active || pausedManual || autoHeld
+        return backgroundHeld ? "结束屏幕显示保持（后台仍保持唤醒）"
+                              : "结束屏幕显示保持，恢复屏保/息屏"
+    }
+
     var stateSummary: String {
+        if guiTimer.configured { return displayStatusLine }
         switch manualState {
         case .active:
             return expiry.isEmpty ? "awake" : "awake until \(expiry)"
@@ -1283,7 +2029,8 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     var overallStatusLine: String {
-        WorkModeApp.menuStatus(
+        if guiTimer.configured { return displayStatusLine }
+        return WorkModeApp.menuStatus(
             manualActive: active,
             manualPaused: pausedManual,
             manualLine: stateLine,
@@ -1310,6 +2057,11 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             statusReadable = false
             manualExpiryDeadline = nil
         }
+        diagnostics.observation("manual_observation", fields: [
+            "reason": statusReadable ? "helper_status_valid" : "helper_status_unavailable",
+            "status": active ? "active" : (pausedManual ? "paused" : "off"),
+            "expires": manualExpiryDeadline.map { String($0) } ?? "none"
+        ])
         updateStatusItem()
         watchSessionProcess()
         scheduleManualExpiry(at: manualExpiryDeadline)
@@ -1336,7 +2088,7 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func updateStatusItem() {
         guard let statusItem = item, let button = statusItem.button else { return }
-        let filled = CupState.filled(manual: active, automatic: autoHeld)
+        let filled = guiTimer.held || CupState.filled(manual: active, automatic: autoHeld)
         let symbolName = filled ? "cup.and.saucer.fill" : "cup.and.saucer"
         let configuration = NSImage.SymbolConfiguration(pointSize: 16, weight: .regular)
         let image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)?
@@ -1348,10 +2100,12 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         button.imagePosition = .imageOnly
         // The cup glyph is wider than it is tall; never let it clip in the fixed item.
         button.imageScaling = .scaleProportionallyDown
-        button.toolTip = "Codex Work Mode — \(stateSummary)"
+        let presentation = menuPresentation()
+        let summary = presentation.compactSummary
+        button.toolTip = "Codex Work Mode · \(summary)"
         button.setAccessibilityLabel("Codex Work Mode")
-        button.setAccessibilityValue(stateSummary)
-        button.setAccessibilityHelp("Codex Work Mode menu — \(stateSummary)")
+        button.setAccessibilityValue(summary)
+        button.setAccessibilityHelp("Codex Work Mode · \(summary)")
     }
 
     /// Watches the owned caffeinate process so an automatic or external stop
@@ -1382,11 +2136,63 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: - Read-only power status
 
     var powerSourceLine: String {
-        "Power source: \(powerStatus?.source.rawValue ?? "Loading…")"
+        let label: String
+        switch powerStatus?.source {
+        case .powerAdapter?: label = "电源适配器"
+        case .battery?: label = "电池"
+        case .unavailable?: label = "暂无法确认"
+        case nil: label = "正在读取"
+        }
+        return "供电：\(label)"
     }
 
     var energyModeLine: String {
-        "Energy mode: \(powerStatus?.energyMode.rawValue ?? "Loading…")"
+        let label: String
+        switch powerStatus?.energyMode {
+        case .highPower?: label = "高能耗"
+        case .lowPower?: label = "低电量"
+        case .automatic?: label = "自动"
+        case .unavailable?: label = "暂无法确认"
+        case nil: label = "正在读取"
+        }
+        return "电源模式：\(label)"
+    }
+
+    var localTaskMenuLine: String {
+        switch activityStatus {
+        case .connectionNotSeen: return "已连接任务：尚未收到状态"
+        case .unavailable: return "已连接任务：状态暂无法确认"
+        case .idle: return "已连接任务：暂无活动"
+        case .waiting: return "已连接任务：等待你确认"
+        case .working: return "已连接任务：正在进行"
+        }
+    }
+
+    var automaticMenuLine: String {
+        if !autoEnabled { return "自动保持：已关闭" }
+        switch sessionState {
+        case .locked:
+            guard activityStatus == .working else { return "自动保持：锁屏时无有效任务，已暂停" }
+            break
+        case .sleeping: return "自动保持：睡眠时暂停"
+        case .inactive: return "自动保持：已切换到其他用户"
+        case .unknown: return "自动保持：桌面状态暂不明确"
+        case .active: break
+        }
+        if powerAvailability == .battery { return "自动保持：电池供电时暂停" }
+        if powerAvailability == .unknown { return "自动保持：供电状态暂不明确" }
+        if autoHeld {
+            if sessionState == .locked { return "自动保持：锁屏后台工作中 · 不保持显示" }
+            return autoEngine.graceUntil != nil ? "自动保持：任务结束后短暂保留" : "自动保持：正在保持电脑唤醒"
+        }
+        if autoEngine.asserting { return "自动保持：暂未成功启动" }
+        switch activityStatus {
+        case .connectionNotSeen: return "自动保持：尚未收到任务状态"
+        case .unavailable: return "自动保持：任务状态暂无法确认"
+        case .waiting: return "自动保持：等待你确认"
+        case .idle: return "自动保持：等待已连接的任务"
+        case .working: return "自动保持：正在准备"
+        }
     }
 
     /// Starts at most one power read. Called once at launch and on each menu
@@ -1468,10 +2274,11 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Concise status of the desktop activity snapshot for the menu.
     var activityLine: String {
         switch activityStatus {
-        case .connectionNotSeen: return "Codex: connection not yet seen"
-        case .idle: return "Codex: idle"
-        case .waiting: return "Codex: waiting for approval"
-        case .working: return "Codex: working"
+        case .connectionNotSeen: return "Local hooks: connection not yet seen"
+        case .unavailable: return "Local hooks: state unavailable"
+        case .idle: return "Local hooks: idle"
+        case .waiting: return "Local hooks: waiting for approval"
+        case .working: return "Local hooks: working"
         }
     }
 
@@ -1479,7 +2286,12 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// gate. Purely informational; the Auto awake toggle remains the only
     /// control.
     var autoDetailLine: String {
-        AwakeGate.autoDetail(
+        if activityStatus == .unavailable, autoEnabled,
+           sessionState == .active, powerAvailability == .external,
+           !autoHeld, !autoEngine.asserting {
+            return "Auto: not holding — local hooks unavailable"
+        }
+        return AwakeGate.autoDetail(
             enabled: autoEnabled,
             power: powerAvailability,
             session: sessionState,
@@ -1504,8 +2316,8 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// assertion through the shared gate. Called at launch, on session and power
     /// transitions, on activity-directory changes, on owner process exit, and on
     /// the scheduled renewal/grace timers only. An ineligible gate releases the
-    /// assertion and clears the grace immediately, so neither a lock nor a
-    /// battery change can be masked by a pending grace.
+    /// assertion and clears the grace immediately. A lock may keep only valid
+    /// working tasks, never grace; a battery change always releases.
     func refreshActivity() {
         let now = Date().timeIntervalSince1970
         let snapshot = readActivitySnapshot(now: now)
@@ -1515,7 +2327,8 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let eligible = AwakeGate.autoEligible(
             enabled: autoEnabled,
             power: powerAvailability,
-            session: sessionState
+            session: sessionState,
+            working: snapshot.isWorking
         )
         autoEngine.enabled = autoEnabled
 
@@ -1528,37 +2341,49 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 graceTimer = nil
             }
         } else {
-            stopAutoProcess()
+            stopAutoProcess(reason: snapshot.status == .unavailable && eligible
+                            ? "Auto: not holding — local hooks unavailable"
+                            : AwakeGate.autoDetail(enabled: autoEnabled, power: powerAvailability,
+                                                         session: sessionState, working: snapshot.isWorking,
+                                                         asserting: autoEngine.asserting, held: false,
+                                                         gracePending: autoEngine.graceUntil != nil))
             renewTimer?.cancel()
             renewTimer = nil
             graceTimer?.cancel()
             graceTimer = nil
         }
+        diagnostics.observation("awake_decision", fields: [
+            "reason": autoDetailLine, "status": String(describing: activityStatus),
+            "session": String(describing: sessionState), "power": String(describing: powerAvailability),
+            "enabled": String(autoEnabled), "held": String(autoHeld),
+            "requested": String(autoEngine.asserting), "grace_until": autoEngine.graceUntil.map { String($0) } ?? "none"
+        ])
         updateStatusItem()
         rebuildMenu()
     }
 
     /// Reads and validates the receiver's snapshot. A missing file is
-    /// `connectionNotSeen`; an unreadable file is `idle`; records whose desktop
-    /// owner pid or start signature no longer match are discarded as idle.
+    /// `connectionNotSeen`; unreadable contents or an invalid desktop owner are
+    /// `unavailable`. Neither is evidence of idle work or counts as working.
     func readActivitySnapshot(now: Double) -> ActivitySnapshot {
         guard FileManager.default.fileExists(atPath: activityStateFile.path) else {
+            diagnostics.observation("activity_observation", fields: ["reason": "snapshot_missing", "status": "connectionNotSeen"])
             return .connectionNotSeen
         }
         guard
             let data = FileManager.default.contents(atPath: activityStateFile.path),
             let parsed = ActivitySnapshotParser.parse(data: data, now: now)
         else {
-            return .idle
+            diagnostics.observation("activity_observation", fields: ["reason": "snapshot_unreadable_or_malformed", "status": "unavailable"])
+            return .unavailable
         }
         guard ownerIsValid(pid: parsed.ownerPID, signature: parsed.ownerSignature) else {
-            return ActivitySnapshot(
-                status: .idle,
-                ownerPID: nil,
-                ownerSignature: nil,
-                freshestRefresh: parsed.freshestRefresh
-            )
+            diagnostics.observation("activity_observation", fields: ["reason": "desktop_owner_not_valid", "status": "unavailable",
+                                    "owner_pid": parsed.ownerPID.map(String.init) ?? "none"])
+            return .unavailable
         }
+        diagnostics.observation("activity_observation", fields: ["reason": "snapshot_and_desktop_owner_valid",
+                                "status": String(describing: parsed.status), "owner_pid": parsed.ownerPID.map(String.init) ?? "none"])
         return parsed
     }
 
@@ -1647,7 +2472,7 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return
             }
             // The current bounded process is due for renewal: replace it.
-            stopAutoProcess()
+            stopAutoProcess(reason: "lease_renewal")
             startAutoProcess(now: now)
             return
         }
@@ -1691,8 +2516,10 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
             autoProcess = process
             autoStartedAt = now
             autoHeld = true
+            diagnostics.record("automatic_assertion_started", fields: ["pid": process.processIdentifier, "reason": "idle_sleep_only_bounded_lease"])
             scheduleRenew(at: now + AutoAwakeEngine.renewalSeconds)
         } catch {
+            diagnostics.record("automatic_assertion_start_failed", fields: ["error_code": (error as NSError).code])
             // The assertion was never obtained: report it as not holding and
             // anchor the bounded backoff instead of retrying here.
             autoProcess = nil
@@ -1710,6 +2537,7 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// next renewal boundary.
     func handleAutoProcessExit(_ process: Process?) {
         guard let process = process, let current = autoProcess, current === process else { return }
+        diagnostics.record("automatic_assertion_exited", fields: ["pid": process.processIdentifier, "exit_code": process.terminationStatus])
         autoProcess = nil
         autoHeld = false
         autoStartedAt = Date().timeIntervalSince1970
@@ -1739,10 +2567,10 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// Releases only the automatic assertion: its own caffeinate process,
     /// timers, and engine state. The manual helper session is never touched.
-    func releaseAutoAwake() {
+    func releaseAutoAwake(reason: String = "automatic_reset") {
         autoEngine.enabled = autoEnabled
         autoEngine.reset()
-        stopAutoProcess()
+        stopAutoProcess(reason: reason)
         renewTimer?.cancel()
         renewTimer = nil
         graceTimer?.cancel()
@@ -1752,8 +2580,11 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Cancels only the exact caffeinate process this app started. The
     /// termination handler is detached first so this deliberate stop can never
     /// be mistaken for an unexpected exit and re-arm a backoff.
-    func stopAutoProcess() {
+    func stopAutoProcess(reason: String = "gate_or_work_released") {
         if let process = autoProcess {
+            diagnostics.record("automatic_assertion_released", fields: ["pid": process.processIdentifier,
+                               "reason": reason, "session": String(describing: sessionState),
+                               "power": String(describing: powerAvailability), "status": String(describing: activityStatus)])
             process.terminationHandler = nil
             if process.isRunning {
                 process.terminate()
@@ -1767,130 +2598,184 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleAutoAwake() {
         autoEnabled.toggle()
         UserDefaults.standard.set(autoEnabled, forKey: autoAwakeDefaultsKey)
+        diagnostics.record("auto_toggle", fields: ["enabled": autoEnabled])
         if !autoEnabled {
-            releaseAutoAwake()
+            releaseAutoAwake(reason: "toggle_disabled")
         }
         refreshActivity()
     }
 
     // MARK: - Menu
 
-    /// Assembles the whole menu. Version 1.5 keeps the v1.4.1 five content rows
-    /// and the same targets, tags, and enabled rules:
-    ///   1. overall status (read-only, always top): normal sleep, active manual
-    ///      with its end time, paused manual with its original end time,
-    ///      automatic awake, or status unavailable,
-    ///   2. Auto awake for Codex (checked toggle, directly available),
-    ///   3. manual timer control — one "Keep awake for" submenu (1/4/8 hours
-    ///      and Custom hours…) while inactive, or one direct "Stop timer" row
-    ///      while a session runs, including while it is paused,
-    ///   4. Details (read-only Codex activity, automatic eligibility, power
-    ///      source, energy mode),
-    ///   5. Quit / Stop and Quit.
-    /// That is five content rows and no new mode selector. The two submenus
-    /// deliberately carry no menu delegate: opening one must never fire
-    /// `menuWillOpen`, refresh state, rebuild this menu, or start another power
-    /// probe. The read-only power rows keep their item references
-    /// (`powerSourceItem`/`energyModeItem`), so an asynchronous power completion
-    /// retitles them inside the nested menu without touching the rest of the
-    /// menu.
+    /// Only the top-level menu has a delegate. Purpose descriptions belong
+    /// beside their choices; diagnostic information stays in a secondary menu.
     func rebuildMenu() {
         guard let statusItem = item, let menu = statusItem.menu else { return }
-        menu.removeAllItems()
+        populateMenu(menu)
+    }
 
-        // 1. Overall state, read-only and always first.
-        let status = NSMenuItem(title: overallStatusLine, action: nil, keyEquivalent: "")
+    /// Shared by the actual menu and offscreen layout checks. This constructs
+    /// native items only; it does not show a menu or create a status bar item.
+    func populateMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+        backgroundStatusItem = nil
+        let presentation = menuPresentation()
+        let status = NSMenuItem(title: presentation.heading, action: nil, keyEquivalent: "")
         status.isEnabled = false
+        let card = WorkMenuStatusView(presentation)
+        status.view = card
+        statusCard = card
+        statusHeadingItem = status
         menu.addItem(status)
 
-        menu.addItem(.separator())
+        let displayConfigured = guiTimer.configured
+        let manualConfigured = active || pausedManual
 
-        // 2. Automatic awake toggle, directly available and never nested, so
-        //    its checked state is one click away.
-        let auto = NSMenuItem(
-            title: "Auto awake for Codex",
-            action: #selector(toggleAutoAwake),
-            keyEquivalent: ""
-        )
-        auto.target = self
-        auto.state = autoEnabled ? .on : .off
-        auto.isEnabled = true
-        menu.addItem(auto)
-
-        // 3. Manual timer control. Same targets, tags, and enabled rules as
-        //    before. A paused session keeps the direct Stop timer row so it
-        //    stays cancelable, but it is not an active awake assertion.
-        if active || pausedManual {
-            let stop = NSMenuItem(title: "Stop timer", action: #selector(stopMode), keyEquivalent: "")
+        // Every configured source keeps its own stop action. One source never
+        // replaces or disables another.
+        if displayConfigured {
+            let stop = NSMenuItem(title: displayStopTitle, action: #selector(stopGUIWork), keyEquivalent: "")
+            stop.target = self
+            stop.isEnabled = !busy
+            menu.addItem(stop)
+            if manualConfigured {
+                // The display request owns the card above, so the manual timer
+                // keeps its own truthful, read-only status row beside it.
+                let background = NSMenuItem(title: backgroundMenuLine, action: nil, keyEquivalent: "")
+                background.isEnabled = false
+                menu.addItem(background)
+                backgroundStatusItem = background
+            }
+        }
+        if manualConfigured {
+            let stop = NSMenuItem(title: "结束后台计时", action: #selector(stopMode), keyEquivalent: "")
             stop.target = self
             stop.isEnabled = statusReadable && !busy
             menu.addItem(stop)
-        } else {
-            let keepAwake = NSMenuItem(title: "Keep awake for", action: nil, keyEquivalent: "")
-            keepAwake.isEnabled = statusReadable && !busy
+        }
+        menu.addItem(.separator())
+
+        let auto = NSMenuItem(title: "自动保持后台工作（接通电源）", action: #selector(toggleAutoAwake), keyEquivalent: "")
+        auto.target = self
+        auto.state = autoEnabled ? .on : .off
+        auto.isEnabled = true
+        auto.toolTip = "接通电源时，自动保持已连接的后台任务；不保持屏幕显示。"
+        menu.addItem(auto)
+
+        if !manualConfigured {
+            let manual = NSMenuItem(title: "手动后台计时", action: nil, keyEquivalent: "")
+            manual.isEnabled = statusReadable && !busy
             let timers = NSMenu()
             timers.autoenablesItems = false
+            timers.addItem(menuNote("仅保持电脑唤醒，屏保与息屏照常"))
             for hours in [1, 4, 8] {
-                let start = NSMenuItem(
-                    title: "\(hours) hour\(hours == 1 ? "" : "s")",
-                    action: #selector(startFromMenu(_:)),
-                    keyEquivalent: ""
-                )
+                let start = NSMenuItem(title: "\(hours) 小时", action: #selector(startFromMenu(_:)), keyEquivalent: "")
                 start.target = self
                 start.tag = hours * 3600
-                start.isEnabled = statusReadable && !busy
+                start.isEnabled = manual.isEnabled
                 timers.addItem(start)
             }
-            let custom = NSMenuItem(
-                title: "Custom hours…",
-                action: #selector(startCustomFromMenu(_:)),
-                keyEquivalent: ""
-            )
+            let custom = NSMenuItem(title: "自定小时数…", action: #selector(startCustomFromMenu(_:)), keyEquivalent: "")
             custom.target = self
-            custom.isEnabled = statusReadable && !busy
+            custom.isEnabled = manual.isEnabled
             timers.addItem(custom)
-            keepAwake.submenu = timers
-            menu.addItem(keepAwake)
+            timers.addItem(.separator())
+            timers.addItem(menuNote("锁屏/睡眠时暂停，恢复不延长计时"))
+            manual.submenu = timers
+            menu.addItem(manual)
+        }
+        menu.addItem(menuNote("后台选项不保持显示，屏保与息屏照常"))
+        menu.addItem(.separator())
+
+        if !displayConfigured {
+            let desktop = NSMenuItem(title: "保持屏幕显示", action: nil, keyEquivalent: "")
+            // Eligibility is the current unlocked active session only: battery
+            // and Low Power Mode stay available and no energy setting is written.
+            desktop.isEnabled = !busy && AwakeGate.sessionAllowsAssertion(sessionState)
+            let timers = NSMenu()
+            timers.autoenablesItems = false
+            timers.addItem(menuNote("保持屏幕显示，自动屏保会暂缓"))
+            for (title, seconds) in [("30 分钟", 1800), ("1 小时", 3600), ("4 小时", 14400), ("8 小时", 28800)] {
+                let start = NSMenuItem(title: title, action: #selector(startGUIWork(_:)), keyEquivalent: "")
+                start.target = self
+                start.tag = seconds
+                start.isEnabled = desktop.isEnabled
+                timers.addItem(start)
+            }
+            let custom = NSMenuItem(title: "自定小时数…", action: #selector(startDisplayCustomFromMenu(_:)), keyEquivalent: "")
+            custom.target = self
+            custom.isEnabled = desktop.isEnabled
+            timers.addItem(custom)
+            timers.addItem(.separator())
+            let until = NSMenuItem(title: "直到我关闭", action: #selector(startDisplayUntilStopped(_:)), keyEquivalent: "")
+            until.target = self
+            until.isEnabled = desktop.isEnabled
+            timers.addItem(until)
+            timers.addItem(.separator())
+            timers.addItem(menuNote("结束后，系统可能立即屏保或息屏"))
+            timers.addItem(menuNote("手动屏保与锁屏仍可生效"))
+            timers.addItem(menuNote("电池供电与低电量模式下同样可用"))
+            timers.addItem(menuNote("锁屏/睡眠时暂停，原结束时间不变"))
+            if !AwakeGate.sessionAllowsAssertion(sessionState) {
+                timers.addItem(menuNote("请先解锁当前桌面；不会自动解锁"))
+            }
+            desktop.submenu = timers
+            menu.addItem(desktop)
+            menu.addItem(.separator())
         }
 
-        // 4. Details holds the read-only rows. Their item references are kept
-        //    so an in-flight power read can retitle them in place.
-        let details = NSMenuItem(title: "Details", action: nil, keyEquivalent: "")
+        let screenSaver = NSMenuItem(title: "立即启动屏保", action: #selector(startScreenSaver), keyEquivalent: "")
+        screenSaver.target = self
+        screenSaver.isEnabled = !busy
+        screenSaver.toolTip = "启动系统屏保；会结束屏幕显示保持，后台任务不受影响。"
+        menu.addItem(screenSaver)
+        menu.addItem(menuNote("后台任务会继续，锁屏与息屏仍按 macOS 设置"))
+        menu.addItem(.separator())
+
+        let details = NSMenuItem(title: "更多状态与日志", action: nil, keyEquivalent: "")
         details.isEnabled = true
         let detailsMenu = NSMenu()
         detailsMenu.autoenablesItems = false
-
-        let activity = NSMenuItem(title: activityLine, action: nil, keyEquivalent: "")
-        activity.isEnabled = false
-        detailsMenu.addItem(activity)
-
-        // Explains why automatic awake is or is not held (off, battery, no
-        // work, paused by lock/sleep/session, or unavailable). Read-only: it is
-        // not a second mode selector.
-        let autoDetail = NSMenuItem(title: autoDetailLine, action: nil, keyEquivalent: "")
-        autoDetail.isEnabled = false
-        detailsMenu.addItem(autoDetail)
-
+        detailsMenu.addItem(menuNote(localTaskMenuLine))
+        detailsMenu.addItem(menuNote("Work/圆点任务：暂不能自动识别"))
+        detailsMenu.addItem(menuNote(automaticMenuLine))
         let powerSource = NSMenuItem(title: powerSourceLine, action: nil, keyEquivalent: "")
         powerSource.isEnabled = false
         detailsMenu.addItem(powerSource)
         powerSourceItem = powerSource
-
         let energyMode = NSMenuItem(title: energyModeLine, action: nil, keyEquivalent: "")
         energyMode.isEnabled = false
         detailsMenu.addItem(energyMode)
         energyModeItem = energyMode
-
+        detailsMenu.addItem(.separator())
+        let showLogs = NSMenuItem(title: "查看诊断日志", action: #selector(showDiagnosticLogs), keyEquivalent: "")
+        showLogs.target = self
+        detailsMenu.addItem(showLogs)
+        let exportLogs = NSMenuItem(title: "导出诊断日志…", action: #selector(exportDiagnosticLogs), keyEquivalent: "")
+        exportLogs.target = self
+        detailsMenu.addItem(exportLogs)
         details.submenu = detailsMenu
         menu.addItem(details)
-
         menu.addItem(.separator())
-
-        let quit = NSMenuItem(title: active ? "Stop and Quit" : "Quit",
+        let quit = NSMenuItem(title: active || pausedManual || guiTimer.configured ? "结束计时并退出" : "退出",
                               action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
         quit.isEnabled = !busy
         menu.addItem(quit)
+    }
+
+    func menuNote(_ text: String) -> NSMenuItem {
+        let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: 340, height: 25))
+        let label = NSTextField(labelWithString: text)
+        label.font = .systemFont(ofSize: 11.5)
+        label.textColor = .secondaryLabelColor
+        label.frame = NSRect(x: 16, y: 4, width: 308, height: 18)
+        label.lineBreakMode = .byTruncatingTail
+        view.addSubview(label)
+        item.view = view
+        return item
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -1903,15 +2788,131 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rewatchActivity()
         refreshActivity()
         requestPowerStatusRead()
+        updateMenuClock()
+        startMenuClock()
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuClock?.invalidate()
+        menuClock = nil
     }
 
     // MARK: - Actions
+
+    /// The finite display choices the submenu offers: 30 minutes, 1/4/8 hours.
+    static let displayFiniteChoices = [1800, 3600, 14400, 28800]
+
+    @objc func startGUIWork(_ sender: NSMenuItem) {
+        guard !busy, !guiTimer.configured, Self.displayFiniteChoices.contains(sender.tag) else { return }
+        startDisplayHold(seconds: sender.tag)
+    }
+
+    /// Starts the explicit display hold for a finite whole-second duration. The
+    /// only gate is the current unlocked active session: power source and energy
+    /// mode never participate, and no OS energy setting is written.
+    func startDisplayHold(seconds: Int) {
+        refreshSessionNow()
+        guard AwakeGate.sessionAllowsAssertion(sessionState) else {
+            presentFailure("请先解锁当前桌面，再开始屏幕显示保持。")
+            return
+        }
+        if !guiTimer.start(seconds: seconds, eligible: true) {
+            presentFailure("暂时无法开始屏幕显示保持，请查看诊断日志。")
+        }
+    }
+
+    /// Starts the until-stopped display request. It has no deadline and stays
+    /// distinct from an off state and from a finite request.
+    @objc func startDisplayUntilStopped(_ sender: NSMenuItem) {
+        guard !busy, !guiTimer.configured else { return }
+        refreshSessionNow()
+        guard AwakeGate.sessionAllowsAssertion(sessionState) else {
+            presentFailure("请先解锁当前桌面，再开始屏幕显示保持。")
+            return
+        }
+        if !guiTimer.startUntilStopped(eligible: true) {
+            presentFailure("暂时无法开始屏幕显示保持，请查看诊断日志。")
+        }
+    }
+
+    @objc func stopGUIWork() {
+        guard !busy else { return }
+        guiTimer.stop(reason: "user_cancelled")
+    }
+
+    // MARK: - Screen saver
+
+    /// Installed system screen saver. This is a read-only reference: the app
+    /// never changes the screen saver selection, its timeout, the password
+    /// requirement or any energy setting, and it never dismisses or relaunches
+    /// the screen saver.
+    static let screenSaverEnginePath = "/System/Library/CoreServices/ScreenSaverEngine.app"
+
+    /// Test seam: production opens the installed system ScreenSaverEngine
+    /// through NSWorkspace and reports launch failure; an isolated test
+    /// substitutes a harmless closure and never launches it.
+    var launchScreenSaver: () -> Bool = { WorkModeApp.openScreenSaver() }
+
+    /// Opens the installed system screen saver. Returns false when the engine is
+    /// missing or NSWorkspace could not start it; the caller must not claim the
+    /// screen saver is running in that case.
+    static func openScreenSaver() -> Bool {
+        let url = URL(fileURLWithPath: screenSaverEnginePath)
+        guard FileManager.default.fileExists(atPath: url.path) else { return false }
+        return NSWorkspace.shared.open(url)
+    }
+
+    /// Stops only this app's explicit display hold, then asks the system to
+    /// start the screen saver. Background and automatic awake work are never
+    /// cancelled. Returned so the failure path is testable without a modal.
+    @discardableResult
+    func requestScreenSaver() -> Bool {
+        guiTimer.stop(reason: "user_started_screen_saver")
+        let started = launchScreenSaver()
+        diagnostics.record(started ? "screensaver_launch_requested" : "screensaver_launch_failed",
+                           fields: ["reason": "user_action"])
+        return started
+    }
+
+    @objc func startScreenSaver() {
+        guard !busy else { return }
+        guard requestScreenSaver() else {
+            // Never claim the screen saver is running when the launcher failed.
+            presentFailure("暂时无法启动系统屏保；屏保是否运行以 macOS 为准。")
+            return
+        }
+    }
+
+    @objc func showDiagnosticLogs() {
+        do {
+            try FileManager.default.createDirectory(at: diagnostics.directory, withIntermediateDirectories: true,
+                                                     attributes: [.posixPermissions: 0o700])
+            NSWorkspace.shared.open(diagnostics.directory)
+        } catch {
+            presentFailure("暂时无法打开诊断日志。")
+        }
+    }
+
+    @objc func exportDiagnosticLogs() {
+        let panel = NSSavePanel()
+        panel.title = "导出 Codex Work Mode 诊断日志"
+        panel.nameFieldStringValue = "Coffee-Work-Diagnostics.zip"
+        panel.allowedContentTypes = [.zip]
+        activateForDialog()
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        do {
+            try diagnostics.export(to: destination, hookDirectory: activityFolder.appendingPathComponent("diagnostics"))
+        } catch {
+            presentFailure("暂时无法导出诊断日志。")
+        }
+    }
 
     @objc func startFromMenu(_ sender: NSMenuItem) {
         // A new request made while the session is ineligible is created paused,
         // so it never even momentarily creates an awake assertion. The session
         // is re-read first so a lock that arrived since the last menu refresh is
-        // respected.
+        // respected. An explicit display request is never consulted: the two
+        // sources are independent.
         refreshSessionNow()
         let sessionAllows = AwakeGate.sessionAllowsAssertion(sessionState)
         performAction("on", seconds: sender.tag, paused: !sessionAllows)
@@ -1923,27 +2924,37 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Stop action, so extension is intentionally not offered.
     @objc func startCustomFromMenu(_ sender: NSMenuItem) {
         guard !busy else { return }
-        guard let hours = promptForCustomHours() else { return } // Cancel changes nothing.
+        guard let hours = promptForCustomHours(.background) else { return } // Cancel changes nothing.
         refreshSessionNow()
         let sessionAllows = AwakeGate.sessionAllowsAssertion(sessionState)
         performAction("on", seconds: hours * 3600, paused: !sessionAllows)
     }
 
+    /// The display submenu's custom hours… entry. It shares the bounded 1...24
+    /// whole-hour parser but starts a display request, never the background
+    /// helper, and is independent of both the background timer and the
+    /// automatic assertion.
+    @objc func startDisplayCustomFromMenu(_ sender: NSMenuItem) {
+        guard !busy, !guiTimer.configured else { return }
+        guard let hours = promptForCustomHours(.display) else { return } // Cancel changes nothing.
+        startDisplayHold(seconds: hours * 3600)
+    }
+
     /// Native bounded input dialog. Returns the chosen whole hours, or nil when
     /// the user cancels. An out-of-contract entry is explained and re-prompted;
     /// Cancel at any point leaves work-mode state untouched.
-    func promptForCustomHours() -> Int? {
+    func promptForCustomHours(_ purpose: CustomHoursPurpose) -> Int? {
         var entry = String(CustomHours.default)
         while true {
             let alert = NSAlert()
             alert.alertStyle = .informational
-            alert.messageText = "Start Codex Work Mode for custom hours"
+            alert.messageText = purpose.heading
             alert.informativeText = """
-                Enter whole hours from \(CustomHours.minimum) to \(CustomHours.maximum). \
-                Default \(CustomHours.default).
+                输入 \(CustomHours.minimum)～\(CustomHours.maximum) 之间的整数小时。默认 \(CustomHours.default) 小时。
+                \(purpose.detail)
                 """
-            alert.addButton(withTitle: "Start")
-            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: "开始计时")
+            alert.addButton(withTitle: "取消")
             let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 220, height: 24))
             field.stringValue = entry
             field.placeholderString = String(CustomHours.default)
@@ -1967,12 +2978,12 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "Enter whole hours from \(CustomHours.minimum) to \(CustomHours.maximum)"
+        alert.messageText = "请输入 \(CustomHours.minimum)～\(CustomHours.maximum) 之间的整数小时"
         let detail = trimmed.isEmpty
-            ? "Nothing was entered."
-            : "“\(trimmed)” is not a whole number of hours in range."
-        alert.informativeText = "\(detail) Use a whole number such as \(CustomHours.default)."
-        alert.addButton(withTitle: "OK")
+            ? "还没有输入小时数。"
+            : "“\(trimmed)”不是范围内的整数小时。"
+        alert.informativeText = "\(detail) 例如输入 \(CustomHours.default)。"
+        alert.addButton(withTitle: "好")
         activateForDialog()
         alert.runModal()
     }
@@ -1991,6 +3002,7 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func quitApp() {
         guard !busy else { return }
+        guiTimer.stop(reason: "app_quit")
         if active {
             // Stop and Quit: stop first so the label matches what happened.
             performAction("off", quit: true)
@@ -2010,6 +3022,7 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildMenu()
         queue.async { [self] in
             let result = invoke(mode, seconds: seconds, paused: paused)
+            diagnostics.record("manual_action", fields: ["mode": mode, "paused": paused, "exit_code": result.0])
             DispatchQueue.main.async { [self] in
                 busy = false
                 refresh(reconcile: false)
@@ -2037,9 +3050,9 @@ final class WorkModeApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alertVisible = true
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "Codex Work Mode could not be changed"
+        alert.messageText = "本次操作未完成"
         let detail = message.trimmingCharacters(in: .whitespacesAndNewlines)
-        alert.informativeText = detail.isEmpty ? "The helper did not report a result." : detail
+        alert.informativeText = detail.isEmpty ? "暂时无法确认结果，请查看诊断日志。" : detail
         if #available(macOS 14.0, *) {
             NSApp.activate()
         } else {

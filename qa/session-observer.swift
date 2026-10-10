@@ -55,11 +55,12 @@ var observerSnapshot = SessionState.unknown
 func observerReport(_ event: String) {
     let power = PowerSourceMonitor.providingPowerSource()
     let session = observerGate.resolve(snapshot: observerSnapshot)
-    let autoEligible = AwakeGate.autoEligible(enabled: true, power: power, session: session)
+    let autoEligible = AwakeGate.autoEligible(enabled: true, power: power, session: session, working: false)
+    let autoIfVerifiedWork = AwakeGate.autoEligible(enabled: true, power: power, session: session, working: true)
     let manualEligible = AwakeGate.sessionAllowsAssertion(session)
     print("\(observerFormatter.string(from: Date())) event=\(event) "
         + "power=\(observerPowerLabel(power)) session=\(observerSessionLabel(session)) "
-        + "autoEligible=\(autoEligible) manualEligible=\(manualEligible)")
+        + "autoEligible=\(autoEligible) autoIfVerifiedWork=\(autoIfVerifiedWork) manualEligible=\(manualEligible)")
     fflush(stdout)
 }
 

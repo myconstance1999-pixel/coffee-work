@@ -13,7 +13,7 @@ print '== 1. CustomHours parser boundaries (production source) =='
 prefix=build/CustomHoursPrefix.swift
 /usr/bin/sed '/^let app = NSApplication.shared$/,$d' MenuBar.swift > "$prefix"
 /bin/cat tests/custom-hours-main.swift >> "$prefix"
-/usr/bin/swiftc -O -target arm64-apple-macosx13.0 -framework AppKit "$prefix" \
+/usr/bin/swiftc -O -target arm64-apple-macosx13.0 -module-cache-path "$root/build/compile-cache" -framework AppKit "$prefix" \
     -o build/custom-hours-tests
 ./build/custom-hours-tests
 
@@ -22,7 +22,7 @@ print '== 2. PowerStatus parser fixtures (production source) =='
 prefix=build/PowerStatusPrefix.swift
 /usr/bin/sed '/^let app = NSApplication.shared$/,$d' MenuBar.swift > "$prefix"
 /bin/cat tests/power-status-main.swift >> "$prefix"
-/usr/bin/swiftc -O -target arm64-apple-macosx13.0 -framework AppKit "$prefix" \
+/usr/bin/swiftc -O -target arm64-apple-macosx13.0 -module-cache-path "$root/build/compile-cache" -framework AppKit "$prefix" \
     -o build/power-status-tests
 ./build/power-status-tests
 
@@ -31,7 +31,7 @@ print '== 2b. Auto awake engine + power/session gate + activity snapshot parser 
 prefix=build/AutoAwakePrefix.swift
 /usr/bin/sed '/^let app = NSApplication.shared$/,$d' MenuBar.swift > "$prefix"
 /bin/cat tests/auto-awake-main.swift >> "$prefix"
-/usr/bin/swiftc -O -target arm64-apple-macosx13.0 -framework AppKit "$prefix" \
+/usr/bin/swiftc -O -target arm64-apple-macosx13.0 -module-cache-path "$root/build/compile-cache" -framework AppKit "$prefix" \
     -o build/auto-awake-tests
 ./build/auto-awake-tests
 
@@ -98,47 +98,9 @@ print '== 4c. isolated real helper lifecycle (pause/resume/legacy/safety) =='
 /bin/zsh tests/helper-lifecycle-tests.sh
 
 print ''
-print '== 5. menu contract in source (v1.4.1 hierarchy) =='
-/usr/bin/grep -q 'Custom hours…' MenuBar.swift && print 'PASS: Custom hours… menu item present'
-/usr/bin/grep -q 'for hours in \[1, 4, 8\]' MenuBar.swift && print 'PASS: 1/4/8 presets preserved'
-/usr/bin/grep -q 'title: "Stop timer"' MenuBar.swift && print 'PASS: Stop timer action present'
-/usr/bin/grep -q 'title: "Keep awake for"' MenuBar.swift && print 'PASS: Keep awake for submenu present'
-/usr/bin/grep -q 'title: "Details"' MenuBar.swift && print 'PASS: Details submenu present'
-/usr/bin/grep -q '#selector(stopMode)' MenuBar.swift && print 'PASS: Stop timer uses the existing stopMode action'
-/usr/bin/grep -q '#selector(startFromMenu(_:))' MenuBar.swift && print 'PASS: preset rows use the existing startFromMenu action'
-/usr/bin/grep -q '#selector(startCustomFromMenu(_:))' MenuBar.swift && print 'PASS: custom row uses the existing startCustomFromMenu action'
-/usr/bin/grep -q '"Power source: ' MenuBar.swift && print 'PASS: power source row present'
-/usr/bin/grep -q '"Energy mode: ' MenuBar.swift && print 'PASS: energy mode row present'
-/usr/bin/grep -q 'Loading…' MenuBar.swift && print 'PASS: Loading… row state present'
-/usr/bin/grep -q '"/usr/sbin/system_profiler"' MenuBar.swift && print 'PASS: read-only system_profiler probe present'
-/usr/bin/grep -q 'SPPowerDataType' MenuBar.swift && print 'PASS: SPPowerDataType read present'
-/usr/bin/grep -q '"/usr/bin/pmset"' MenuBar.swift && print 'PASS: read-only pmset probe present'
-/usr/bin/grep -q '\["-g", "custom"\]' MenuBar.swift && print 'PASS: pmset limited to -g custom'
-/usr/bin/grep -q 'Auto awake for Codex' MenuBar.swift && print 'PASS: Auto awake for Codex item present'
-/usr/bin/grep -q 'cup.and.saucer.fill' MenuBar.swift && print 'PASS: filled cup symbol preserved'
-/usr/bin/grep -q 'codex-activity' MenuBar.swift && print 'PASS: own activity snapshot folder bound'
-/usr/bin/grep -q '"/usr/bin/caffeinate"' MenuBar.swift && print 'PASS: owned caffeinate present'
-/usr/bin/grep -q '"-w", String(ProcessInfo.processInfo.processIdentifier)' MenuBar.swift && print 'PASS: caffeinate tied to the app pid for crash safety'
-/usr/bin/grep -q 'graceSeconds: Double = 120' MenuBar.swift && print 'PASS: 120 second grace present'
-/usr/bin/grep -q 'autoAwakeForCodex' MenuBar.swift && print 'PASS: only the auto toggle setting is persisted'
-# v1.5 session/power-aware gate contract in source.
-/usr/bin/grep -q 'IOPSNotificationCreateRunLoopSource' MenuBar.swift && print 'PASS: power changes use the IOKit run-loop source'
-/usr/bin/grep -q 'IOPSCopyPowerSourcesInfo' MenuBar.swift && print 'PASS: read-only IOKit power-source sample present'
-/usr/bin/grep -q 'CGSessionCopyCurrentDictionary' MenuBar.swift && print 'PASS: current session read through CGSessionCopyCurrentDictionary'
-/usr/bin/grep -q 'CGSSessionScreenIsLocked' MenuBar.swift && print 'PASS: undocumented lock key handled explicitly'
-/usr/bin/grep -q 'com.apple.screenIsLocked' MenuBar.swift && print 'PASS: distributed lock notification observed'
-/usr/bin/grep -q 'com.apple.screenIsUnlocked' MenuBar.swift && print 'PASS: distributed unlock notification observed'
-/usr/bin/grep -q 'willSleepNotification' MenuBar.swift && print 'PASS: willSleep observed'
-/usr/bin/grep -q 'didWakeNotification' MenuBar.swift && print 'PASS: didWake observed'
-/usr/bin/grep -q 'sessionDidResignActiveNotification' MenuBar.swift && print 'PASS: session resign-active observed'
-/usr/bin/grep -q 'sessionDidBecomeActiveNotification' MenuBar.swift && print 'PASS: session become-active observed'
-/usr/bin/grep -q 'struct SessionGate' MenuBar.swift && print 'PASS: separate sleep/inactive/lock latches present'
-/usr/bin/grep -q 'sessionAllowsAssertion' MenuBar.swift && print 'PASS: one shared session gate for auto and manual'
-/usr/bin/grep -q '"Timer paused' MenuBar.swift && print 'PASS: paused manual status preserved with its deadline'
-/usr/bin/grep -q 'Auto: paused' MenuBar.swift && print 'PASS: automatic eligibility explained in Details'
-/usr/bin/grep -q 'Auto: ready — no Codex work' MenuBar.swift && print 'PASS: no-work reason present'
-/usr/bin/grep -q 'QAPowerSourceMonitor\|QASessionSampler' MenuBar.swift && print 'FAIL: QA test controls leaked into production' && exit 1
-print 'PASS: no QA-only test controls in the production source'
+print '== 5. native menu behavior and offscreen presentation =='
+/bin/zsh tests/validate-menu.sh
+/bin/zsh tests/validate-availability.sh
 
 print ''
 print '== 5b. nested-menu integrity: no delegate on any submenu, rows keep item refs =='
@@ -227,31 +189,14 @@ fi
 print 'PASS: pmset invoked only as -g custom; no power-setting/privileged command in MenuBar.swift'
 
 print ''
-print '== 7. automatic awake guard: one owned caffeinate, idle-only, no helper/session writes =='
-# The app owns exactly one caffeinate invocation, its own; it never writes the
-# manual helper session file or the activity snapshot. v1.5 requests idle sleep
-# only: -i is present and -d/-u/-s never are.
-if [ "$(/usr/bin/grep -c '"/usr/bin/caffeinate"' MenuBar.swift)" != 1 ]; then
-    print 'FAIL: caffeinate referenced outside the single owned process'
-    exit 1
-fi
-/usr/bin/grep -q '"\-i",' MenuBar.swift || {
-    print 'FAIL: automatic assertion does not request idle sleep (-i)'
-    exit 1
-}
-if /usr/bin/grep -nE '"-d"|"-u"|"-s"' MenuBar.swift; then
-    print 'FAIL: automatic assertion still requests a display/user/system sleep flag'
-    exit 1
-fi
-print 'PASS: automatic assertion is -i only'
-if /usr/bin/grep -q 'appendingPathComponent("session")' MenuBar.swift; then
-    # The app only reads the helper session for its process watch; it must never
-    # write it. No write API may be reached with that path.
-    if /usr/bin/grep -qE 'write\(to:|createFile\(atPath: session|removeItem\(at: session' MenuBar.swift; then
-        print 'FAIL: app appears to write the manual helper session file'
-        exit 1
-    fi
-fi
+print '== 7. automatic idle-only and finite GUI assertion contracts; no session writes =='
+# Automatic/background assertions remain idle-only. The accepted v1.6 GUI
+# timer is the sole finite display exception, with the same deadline/session
+# and owning-process limits. A whole-app ban on -d incorrectly rejected it.
+/usr/bin/python3 tests/assertion-contract-tests.py
+# The scoped Python guard also rejects file mutations outside DiagnosticLog.
+# Its accepted bounded log rotation/export writes are unrelated to the helper
+# session; matching any write(to:) anywhere produced a false failure here.
 if /usr/bin/grep -q 'writeState\|state.json.tmp' MenuBar.swift; then
     print 'FAIL: app must not write the hook receiver activity state'
     exit 1
@@ -331,7 +276,7 @@ print '== 9. isolated read-only session observer (same production adapter) =='
 prefix=build/ObserverPrefix.swift
 /usr/bin/sed '/^let app = NSApplication.shared$/,$d' MenuBar.swift > "$prefix"
 /bin/cat qa/session-observer.swift >> "$prefix"
-/usr/bin/swiftc -O -target arm64-apple-macosx13.0 -framework AppKit -framework CoreGraphics \
+/usr/bin/swiftc -O -target arm64-apple-macosx13.0 -module-cache-path "$root/build/compile-cache" -framework AppKit -framework CoreGraphics \
     -framework IOKit "$prefix" -o build/session-observer
 ./build/session-observer --seconds 2
 print 'PASS: observer compiled and sampled the real session read-only'

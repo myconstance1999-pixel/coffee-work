@@ -316,7 +316,7 @@ do {
 
 // MARK: - Shared awake gate (power + session eligibility)
 
-autoCheck("only an active session allows an assertion",
+autoCheck("manual and GUI assertions require an active session",
           AwakeGate.sessionAllowsAssertion(.active)
           && AwakeGate.sessionAllowsAssertion(.locked) == false
           && AwakeGate.sessionAllowsAssertion(.sleeping) == false
@@ -324,32 +324,32 @@ autoCheck("only an active session allows an assertion",
           && AwakeGate.sessionAllowsAssertion(.unknown) == false)
 
 autoCheck("auto eligible only with the toggle, external power, and an active session",
-          AwakeGate.autoEligible(enabled: true, power: .external, session: .active))
+          AwakeGate.autoEligible(enabled: true, power: .external, session: .active, working: false))
 autoCheck("auto ineligible on battery",
-          AwakeGate.autoEligible(enabled: true, power: .battery, session: .active) == false)
+          AwakeGate.autoEligible(enabled: true, power: .battery, session: .active, working: false) == false)
 autoCheck("auto ineligible on unknown power",
-          AwakeGate.autoEligible(enabled: true, power: .unknown, session: .active) == false)
-autoCheck("auto ineligible while locked",
-          AwakeGate.autoEligible(enabled: true, power: .external, session: .locked) == false)
+          AwakeGate.autoEligible(enabled: true, power: .unknown, session: .active, working: false) == false)
+autoCheck("locked without verified work is ineligible",
+          AwakeGate.autoEligible(enabled: true, power: .external, session: .locked, working: false) == false)
 autoCheck("auto ineligible while asleep",
-          AwakeGate.autoEligible(enabled: true, power: .external, session: .sleeping) == false)
+          AwakeGate.autoEligible(enabled: true, power: .external, session: .sleeping, working: false) == false)
 autoCheck("auto ineligible while the session is inactive",
-          AwakeGate.autoEligible(enabled: true, power: .external, session: .inactive) == false)
+          AwakeGate.autoEligible(enabled: true, power: .external, session: .inactive, working: false) == false)
 autoCheck("auto ineligible while the session is unknown",
-          AwakeGate.autoEligible(enabled: true, power: .external, session: .unknown) == false)
+          AwakeGate.autoEligible(enabled: true, power: .external, session: .unknown, working: false) == false)
 autoCheck("auto ineligible while the toggle is off",
-          AwakeGate.autoEligible(enabled: false, power: .external, session: .active) == false)
+          AwakeGate.autoEligible(enabled: false, power: .external, session: .active, working: false) == false)
 // Manual awake is an explicit user request: the same active session allows it
 // while the very same power state keeps automatic awake ineligible.
 autoCheck("manual eligibility is independent of power",
           AwakeGate.sessionAllowsAssertion(.active)
-          && AwakeGate.autoEligible(enabled: true, power: .battery, session: .active) == false
-          && AwakeGate.autoEligible(enabled: true, power: .unknown, session: .active) == false)
+          && AwakeGate.autoEligible(enabled: true, power: .battery, session: .active, working: false) == false
+          && AwakeGate.autoEligible(enabled: true, power: .unknown, session: .active, working: false) == false)
 
-autoCheck("detail names a locked pause",
+autoCheck("detail names a locked pause without verified work",
           AwakeGate.autoDetail(enabled: true, power: .external, session: .locked,
-                               working: true, asserting: false, held: false, gracePending: false)
-          == "Auto: paused — screen locked")
+                               working: false, asserting: false, held: false, gracePending: false)
+          == "Auto: paused — screen locked, no verified work")
 autoCheck("detail names battery",
           AwakeGate.autoDetail(enabled: true, power: .battery, session: .active,
                                working: true, asserting: false, held: false, gracePending: false)
@@ -365,7 +365,7 @@ autoCheck("detail names an unknown session",
 autoCheck("detail names no work",
           AwakeGate.autoDetail(enabled: true, power: .external, session: .active,
                                working: false, asserting: false, held: false, gracePending: false)
-          == "Auto: ready — no Codex work")
+          == "Auto: ready — local hooks idle")
 autoCheck("detail names a held assertion",
           AwakeGate.autoDetail(enabled: true, power: .external, session: .active,
                                working: true, asserting: true, held: true, gracePending: false)
@@ -473,7 +473,7 @@ var sleepOnly = SessionGate()
 sleepOnly.apply(.willSleep)
 autoCheck("a sleeping session still fails the shared gate",
           AwakeGate.autoEligible(enabled: true, power: .external,
-                                 session: sleepOnly.resolve(snapshot: .active)) == false)
+                                 session: sleepOnly.resolve(snapshot: .active), working: false) == false)
 
 // MARK: - Authorization-aware automatic engine
 
@@ -496,10 +496,10 @@ var gatedGrace = AutoAwakeEngine()
 _ = gatedGrace.step(working: true, eligible: true, now: 0)
 _ = gatedGrace.step(working: false, eligible: true, now: 10)
 autoCheck("work-to-idle starts the 120s grace while eligible", gatedGrace.graceUntil == 130)
-autoCheck("a lock during grace releases before the deadline",
+autoCheck("an ineligible transition releases before the grace deadline",
           gatedGrace.step(working: true, eligible: false, now: 20) == false
           && gatedGrace.asserting == false && gatedGrace.graceUntil == nil)
-autoCheck("waking while locked still cannot resume",
+autoCheck("an ineligible wake cannot resume",
           gatedGrace.step(working: true, eligible: false, now: 30) == false)
 autoCheck("unlocking with current work resumes",
           gatedGrace.step(working: true, eligible: true, now: 31) == true)

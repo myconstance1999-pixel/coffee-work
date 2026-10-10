@@ -15,7 +15,8 @@ input, tool output, cwd, transcript path, model, permission mode, and every
 other payload field are never read into the snapshot and never written. The
 payload is parsed only for `hook_event_name`, `session_id`, and `turn_id`;
 `transcript_path` and `last_assistant_message` are deliberately untouched.
-No log file is kept; exactly one current state file is published.
+One current state file is published. A separate bounded diagnostic history
+records only event names, hashed identities, owner metadata and result reasons.
 
 Turn contract
 -------------
@@ -96,6 +97,59 @@ PS_PATH = "/bin/ps"
 PS_ARGUMENTS = ["-axo", "pid=,ppid=,lstart=,comm="]
 STATE_FILE_NAME = "state.json"
 LOCK_FILE_NAME = "lock"
+
+LOG_MAX_BYTES = 256 * 1024
+LOG_ARCHIVES = 3
+
+
+def diagnostic(state_dir, event, session_id=None, turn_id=None, **fields):
+    """Best-effort metadata only, independently locked and bounded.
+
+    Never serialize a payload or an exception message. A failed log cannot
+    change hook output, state reduction, or exit status.
+    """
+    lock_fd = None
+    try:
+        directory = os.path.join(state_dir, "diagnostics")
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        os.chmod(directory, 0o700)
+        lock_fd = os.open(os.path.join(directory, ".hook.lock"),
+                          os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        row = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+               "producer": "hook", "event": event if event in HANDLED_EVENTS else "receiver_error"}
+        for name, value in [("session_hash", session_id), ("turn_hash", turn_id)]:
+            if isinstance(value, str) and value:
+                row[name] = _hash(value)
+        allowed = {"reason", "owner_pid", "main_pid", "owner_basis", "changed",
+                   "working_count", "waiting_count", "error_type"}
+        for key, value in fields.items():
+            if key in allowed and isinstance(value, (str, int, bool)):
+                row[key] = value[:120] if isinstance(value, str) else value
+        data = (json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
+        path = os.path.join(directory, "hook.jsonl")
+        if os.path.exists(path) and os.stat(path).st_size + len(data) > LOG_MAX_BYTES:
+            for index in range(LOG_ARCHIVES, 0, -1):
+                source = path if index == 1 else path + "." + str(index - 1)
+                destination = path + "." + str(index)
+                if os.path.lexists(destination):
+                    os.unlink(destination)
+                if os.path.lexists(source):
+                    os.rename(source, destination)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+    finally:
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
 
 
 def default_state_dir():
@@ -489,19 +543,25 @@ def main(argv=None):
     except SystemExit:
         return 0
 
+    state_dir = args.state_dir or default_state_dir()
+
     try:
         raw = sys.stdin.read()
         payload = json.loads(raw)
     except Exception:
+        diagnostic(state_dir, None, reason="malformed_payload")
         return 0
     if not isinstance(payload, dict):
+        diagnostic(state_dir, None, reason="malformed_payload")
         return 0
 
     event = payload.get("hook_event_name")
     if not isinstance(event, str) or event not in HANDLED_EVENTS:
+        diagnostic(state_dir, None, reason="unsupported_event")
         return 0
     session_id = payload.get("session_id")
     if not isinstance(session_id, str) or not session_id:
+        diagnostic(state_dir, event, reason="missing_session_identity")
         return 0
     turn_id = payload.get("turn_id")
     if not isinstance(turn_id, str) or not turn_id:
@@ -521,15 +581,17 @@ def main(argv=None):
     )
     owner = classify_owner(records, ancestry_pid)
     if owner is None:
+        diagnostic(state_dir, event, session_id, turn_id,
+                   reason="process_table_unavailable" if not records else "desktop_ancestry_not_verified")
         # Not a desktop-owned Codex task: stay silent and leave state alone.
         if event == "Stop":
             sys.stdout.write("{}\n")
         return 0
 
-    state_dir = args.state_dir or default_state_dir()
     try:
         descriptor = acquire_lock(state_dir)
     except Exception:
+        diagnostic(state_dir, event, session_id, turn_id, reason="state_lock_failed")
         if event == "Stop":
             sys.stdout.write("{}\n")
         return 0
@@ -540,8 +602,15 @@ def main(argv=None):
         )
         if changed:
             write_state(state_dir, new_state)
+        turns = new_state.get("turns", [])
+        diagnostic(state_dir, event, session_id, turn_id,
+                   reason="owner_verified_state_changed" if changed else "owner_verified_no_reducer_change",
+                   owner_pid=owner["pid"], main_pid=owner.get("main_pid") or 0,
+                   owner_basis="bundled_codex_under_desktop", changed=changed,
+                   working_count=sum(t.get("state") == "working" for t in turns),
+                   waiting_count=sum(t.get("state") == "waiting" for t in turns))
     except Exception:
-        pass
+        diagnostic(state_dir, event, session_id, turn_id, reason="state_update_failed")
     finally:
         try:
             os.close(descriptor)
